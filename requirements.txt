@@ -1,0 +1,2 @@
+ccxt
+python-telegram-bot
