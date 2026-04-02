@@ -5,25 +5,22 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 nest_asyncio.apply()
 
-TOKEN = '8619361133:AAE6yV2a8ukTgxT41sE6r5DUf6-Bpp1SLkI'
+TOKEN = 'حط_التوكن_هنا'
 CHAT_ID = '165888578'
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 last_signals = {symbol: "Neutral" for symbol in SYMBOLS}
 
-# 💰 المحفظة الافتراضية
 virtual_wallet = {
     "USDT": 10000.0,
     "BTC/USDT": 0.0,
     "ETH/USDT": 0.0,
     "SOL/USDT": 0.0
 }
-# مبلغ الدخول في كل صفقة (نقسم الـ 10 آلاف على 3 عملات تقريباً)
+
 TRADE_AMOUNT_USDT = 3300.0 
 
-exchange = ccxt.kucoin({
-    'proxies': {'http': 'http://proxy.server:3128', 'https': 'http://proxy.server:3128'},
-})
+exchange = ccxt.kucoin()
 
 def calculate_sma(data, period):
     if len(data) < period: return None
@@ -77,67 +74,53 @@ async def get_analysis(symbol):
         print(f"Error: {e}")
         return None, "Error", None
 
-# 📊 أمر التحليل
 async def price_command(update, context):
-    text = "📊 **التحليل الفني (مع فلتر RSI):**\n\n"
+    text = "📊 التحليل الفني:\n\n"
     for sym in SYMBOLS:
         price, sig, rsi = await get_analysis(sym)
         rsi_text = f"{rsi:.2f}" if rsi else "N/A"
-        text += f"🔹 {sym}: {price}\nمؤشر RSI: {rsi_text}\nإشارة: {sig}\n\n"
-    await update.message.reply_text(text, parse_mode='Markdown')
+        text += f"{sym}: {price}\nRSI: {rsi_text}\nSignal: {sig}\n\n"
+    await update.message.reply_text(text)
 
-# 💼 أمر المحفظة
 async def wallet_command(update, context):
-    text = "💼 **كشف حساب المحفظة الوهمية:**\n\n"
-    text += f"💵 كاش USDT: `{virtual_wallet['USDT']:,.2f}`\n\n"
+    text = f"💼 USDT: {virtual_wallet['USDT']:.2f}\n"
     for sym in SYMBOLS:
-        coin_name = sym.split('/')[0]
-        text += f"🪙 {coin_name}: `{virtual_wallet[sym]}`\n"
-    await update.message.reply_text(text, parse_mode='Markdown')
+        text += f"{sym}: {virtual_wallet[sym]}\n"
+    await update.message.reply_text(text)
 
-# ⚙️ محرك المراقبة والتداول الآلي
 async def monitor_logic(context: ContextTypes.DEFAULT_TYPE):
     global last_signals, virtual_wallet
     for sym in SYMBOLS:
         price, current_sig, rsi = await get_analysis(sym)
         if not price: continue
 
-        # --- التنفيذ الآلي (وهمي) ---
-        
-        # 1. الشراء إذا كانت الإشارة Buy ولم نشتريها من قبل
         if current_sig == "🚀 Strong Buy" and last_signals[sym] != "🚀 Strong Buy":
             if virtual_wallet["USDT"] >= TRADE_AMOUNT_USDT and virtual_wallet[sym] == 0:
-                amount_to_buy = TRADE_AMOUNT_USDT / price
-                virtual_wallet[sym] = amount_to_buy
+                amount = TRADE_AMOUNT_USDT / price
+                virtual_wallet[sym] = amount
                 virtual_wallet["USDT"] -= TRADE_AMOUNT_USDT
-                
-                msg = f"🛒 **عملية شراء وهمية!**\nالعملة: {sym}\nالسعر: {price}\nالكمية: {amount_to_buy:.4f}\nالمحفظة الآن: {virtual_wallet['USDT']:.2f} USDT"
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"BUY {sym} @ {price}")
                 last_signals[sym] = "🚀 Strong Buy"
 
-        # 2. البيع إذا كانت الإشارة Sell ونملك كمية من العملة
         elif current_sig == "⚠️ Strong Sell" and last_signals[sym] != "⚠️ Strong Sell":
             if virtual_wallet[sym] > 0:
-                sale_value = virtual_wallet[sym] * price
-                profit_loss = sale_value - TRADE_AMOUNT_USDT
-                
-                virtual_wallet["USDT"] += sale_value
-                virtual_wallet[sym] = 0.0 # تصفير الكمية بعد البيع
-                
-                emoji = "🟩" if profit_loss > 0 else "🟥"
-                msg = f"💰 **عملية بيع وهمية!**\nالعملة: {sym}\nالسعر: {price}\n{emoji} الربح/الخسارة: {profit_loss:.2f} USDT\nالمحفظة الآن: {virtual_wallet['USDT']:.2f} USDT"
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+                value = virtual_wallet[sym] * price
+                virtual_wallet["USDT"] += value
+                virtual_wallet[sym] = 0.0
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"SELL {sym} @ {price}")
                 last_signals[sym] = "⚠️ Strong Sell"
 
 async def main():
     application = Application.builder().token(TOKEN).build()
-    
+
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
-    
-    application.job_queue.run_repeating(monitor_logic, interval=60, first=10)
 
-    print("🚀 نظام التداول الآلي (الوهمي) يعمل الآن.. بانتظار الفرص!")
+    # ✅ الحل هنا
+    job_queue = application.job_queue
+    job_queue.run_repeating(monitor_logic, interval=60, first=10)
+
+    print("Bot is running...")
     await application.run_polling()
 
 if __name__ == "__main__":
