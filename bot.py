@@ -1,16 +1,23 @@
 import ccxt
-import asyncio
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, 
+    CommandHandler, 
+    ContextTypes, 
+    CallbackQueryHandler
+)
 
 # ================= CONFIG =================
 
+# استخدام المتغيرات اللي كتبناها مع بعض في Render
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") 
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
-exchange = ccxt.kucoin()
+# رجعناها لمنصة بينانس (Binance)
+exchange = ccxt.binance()
 
 virtual_wallet = {"USDT": 10000.0}
 for s in SYMBOLS:
@@ -42,8 +49,8 @@ def calculate_rsi(closes, period=14):
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period]) / period if period > 0 else 0
+    avg_loss = sum(losses[:period]) / period if period > 0 else 0
 
     if avg_loss == 0:
         return 100
@@ -54,27 +61,31 @@ def calculate_rsi(closes, period=14):
 # ================= ANALYSIS =================
 
 def get_analysis(symbol):
-    bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
-    bars = bars[:-1]
+    try:
+        bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+        bars = bars[:-1]
 
-    closes = [b[4] for b in bars]
-    volumes = [b[5] for b in bars]
+        closes = [b[4] for b in bars]
+        volumes = [b[5] for b in bars]
 
-    price = closes[-1]
+        price = closes[-1]
 
-    ema20 = ema(closes[-20:], 20)
-    ema50 = ema(closes[-50:], 50)
-    rsi = calculate_rsi(closes)
-    macd_val = macd(closes)
+        ema20 = ema(closes[-20:], 20)
+        ema50 = ema(closes[-50:], 50)
+        rsi = calculate_rsi(closes)
+        macd_val = macd(closes)
 
-    vol_avg = sum(volumes[-20:]) / 20
+        vol_avg = sum(volumes[-20:]) / 20
 
-    if ema20 > ema50 and macd_val > 0 and rsi > 50 and volumes[-1] > vol_avg:
-        return price, "BUY"
-    elif ema20 < ema50 and macd_val < 0 and rsi < 50:
-        return price, "SELL"
+        if ema20 > ema50 and macd_val > 0 and rsi > 50 and volumes[-1] > vol_avg:
+            return price, "BUY"
+        elif ema20 < ema50 and macd_val < 0 and rsi < 50:
+            return price, "SELL"
 
-    return price, "NEUTRAL"
+        return price, "NEUTRAL"
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
+        return None, "NEUTRAL"
 
 # ================= RISK =================
 
@@ -89,37 +100,39 @@ def close_trade(symbol, price):
     entry_price[symbol] = None
     highest_price[symbol] = None
 
-# ================= BOT LOGIC =================
+# ================= BOT LOGIC (Job Queue) =================
 
-async def trading_loop(app):
-    while True:
-        for sym in SYMBOLS:
-            price, signal = get_analysis(sym)
+async def trading_job(context: ContextTypes.DEFAULT_TYPE):
+    if not CHAT_ID:
+        return
+        
+    for sym in SYMBOLS:
+        price, signal = get_analysis(sym)
+        if not price:
+            continue
 
-            if signal == last_signal[sym]:
-                continue
+        if signal == last_signal[sym]:
+            continue
 
-            if signal == "BUY" and virtual_wallet[sym] == 0:
-                qty = position_size(price)
-                cost = qty * price
+        if signal == "BUY" and virtual_wallet[sym] == 0:
+            qty = position_size(price)
+            cost = qty * price
 
-                if virtual_wallet["USDT"] >= cost:
-                    virtual_wallet[sym] = qty
-                    virtual_wallet["USDT"] -= cost
-                    entry_price[sym] = price
-                    highest_price[sym] = price
+            if virtual_wallet["USDT"] >= cost:
+                virtual_wallet[sym] = qty
+                virtual_wallet["USDT"] -= cost
+                entry_price[sym] = price
+                highest_price[sym] = price
 
-                    await app.bot.send_message(chat_id=CHAT_ID, text=f"🚀 BUY {sym} @ {price}")
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"🚀 BUY {sym} @ {price}")
 
-            elif signal == "SELL" and virtual_wallet[sym] > 0:
-                close_trade(sym, price)
-                await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ SELL {sym} @ {price}")
+        elif signal == "SELL" and virtual_wallet[sym] > 0:
+            close_trade(sym, price)
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ SELL {sym} @ {price}")
 
-            last_signal[sym] = signal
+        last_signal[sym] = signal
 
-        await asyncio.sleep(60)
-
-# ================= COMMANDS =================
+# ================= COMMANDS & BUTTONS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -127,34 +140,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💼 Positions", callback_data="positions")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🤖 BOT READY - تم التفعيل بنجاح", reply_markup=reply_markup)
 
-    await update.message.reply_text("🤖 BOT READY", reply_markup=reply_markup)
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    balance = virtual_wallet["USDT"]
-    await update.message.reply_text(f"💰 Balance: {balance:.2f} USDT")
-
-async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "📊 Positions:\n"
-    for sym in SYMBOLS:
-        msg += f"{sym}: {virtual_wallet[sym]}\n"
-    await update.message.reply_text(msg)
+    if query.data == "stats":
+        balance = virtual_wallet["USDT"]
+        await query.edit_message_text(f"💰 Balance: {balance:.2f} USDT")
+    
+    elif query.data == "positions":
+        msg = "📊 Positions:\n"
+        for sym in SYMBOLS:
+            msg += f"{sym}: {virtual_wallet[sym]}\n"
+        await query.edit_message_text(msg)
 
 # ================= MAIN =================
 
-CHAT_ID = os.getenv("CHAT_ID")
+def main():
+    if not TOKEN:
+        print("❌ TELEGRAM_TOKEN Not Found!")
+        return
 
-async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("positions", positions))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.create_task(trading_loop(app))
+    # تشغيل حلقة التداول بأمان في الخلفية كل 60 ثانية
+    job_queue = app.job_queue
+    job_queue.run_repeating(trading_job, interval=60, first=5)
 
     print("BOT V2 RUNNING 🚀")
-    await app.run_polling()
+    
+    # التشغيل بالطريقة العادية والآمنة
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
