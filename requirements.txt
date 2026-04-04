@@ -2,3 +2,4 @@ ccxt
 requests
 pandas
 numpy
+python-telegram-bot==20.7
