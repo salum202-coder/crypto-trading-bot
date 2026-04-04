@@ -1,127 +1,168 @@
 import ccxt
-import asyncio
-import nest_asyncio
-from telegram.ext import Application, CommandHandler, ContextTypes
+import time
+import requests
+import os
 
-nest_asyncio.apply()
+# ================= Config =================
 
-TOKEN = 'حط_التوكن_هنا'
-CHAT_ID = '165888578'
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-last_signals = {symbol: "Neutral" for symbol in SYMBOLS}
 
-virtual_wallet = {
-    "USDT": 10000.0,
-    "BTC/USDT": 0.0,
-    "ETH/USDT": 0.0,
-    "SOL/USDT": 0.0
-}
+virtual_wallet = {"USDT": 10000.0}
+for s in SYMBOLS:
+    virtual_wallet[s] = 0.0
 
-TRADE_AMOUNT_USDT = 3300.0 
+entry_price = {s: None for s in SYMBOLS}
+highest_price = {s: None for s in SYMBOLS}
+
+RISK_PER_TRADE = 0.02   # 2%
+TRAILING_STOP = 0.03    # 3%
 
 exchange = ccxt.kucoin()
 
-def calculate_sma(data, period):
-    if len(data) < period: return None
-    return sum(data[-period:]) / period
+last_signal = {s: None for s in SYMBOLS}
 
-def check_trend(highs, lows, closes):
-    if closes[-1] > highs[-3]: return "Up"
-    if closes[-1] < lows[-3]: return "Down"
-    return "Side"
+# ================= Telegram =================
+
+def send_message(text):
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+    except:
+        pass
+
+# ================= Indicators =================
+
+def ema(data, period):
+    k = 2 / (period + 1)
+    ema_val = data[0]
+    for price in data:
+        ema_val = price * k + ema_val * (1 - k)
+    return ema_val
 
 def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1: return None
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
+    gains, losses = [], []
+
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100
 
-    if avg_loss == 0: return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-async def get_analysis(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=70)
-        closed_bars = bars[:-1] 
-        
-        closes = [b[4] for b in closed_bars]
-        highs = [b[2] for b in closed_bars]
-        lows = [b[3] for b in closed_bars]
-        
-        current_price = closes[-1]
-        sma_20 = calculate_sma(closes, 20)
-        trend = check_trend(highs, lows, closes)
-        rsi_14 = calculate_rsi(closes, 14)
-        
-        signal = "Neutral"
-        if sma_20 and rsi_14:
-            if current_price > sma_20 and trend == "Up" and rsi_14 > 50:
-                signal = "🚀 Strong Buy"
-            elif current_price < sma_20 and trend == "Down" and rsi_14 < 50:
-                signal = "⚠️ Strong Sell"
-            
-        return current_price, signal, rsi_14
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, "Error", None
+def macd(closes):
+    return ema(closes, 12) - ema(closes, 26)
 
-async def price_command(update, context):
-    text = "📊 التحليل الفني:\n\n"
-    for sym in SYMBOLS:
-        price, sig, rsi = await get_analysis(sym)
-        rsi_text = f"{rsi:.2f}" if rsi else "N/A"
-        text += f"{sym}: {price}\nRSI: {rsi_text}\nSignal: {sig}\n\n"
-    await update.message.reply_text(text)
+# ================= Analysis =================
 
-async def wallet_command(update, context):
-    text = f"💼 USDT: {virtual_wallet['USDT']:.2f}\n"
-    for sym in SYMBOLS:
-        text += f"{sym}: {virtual_wallet[sym]}\n"
-    await update.message.reply_text(text)
+def get_analysis(symbol):
+    bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+    bars = bars[:-1]
 
-async def monitor_logic(context: ContextTypes.DEFAULT_TYPE):
-    global last_signals, virtual_wallet
-    for sym in SYMBOLS:
-        price, current_sig, rsi = await get_analysis(sym)
-        if not price: continue
+    closes = [b[4] for b in bars]
+    volumes = [b[5] for b in bars]
 
-        if current_sig == "🚀 Strong Buy" and last_signals[sym] != "🚀 Strong Buy":
-            if virtual_wallet["USDT"] >= TRADE_AMOUNT_USDT and virtual_wallet[sym] == 0:
-                amount = TRADE_AMOUNT_USDT / price
-                virtual_wallet[sym] = amount
-                virtual_wallet["USDT"] -= TRADE_AMOUNT_USDT
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"BUY {sym} @ {price}")
-                last_signals[sym] = "🚀 Strong Buy"
+    price = closes[-1]
 
-        elif current_sig == "⚠️ Strong Sell" and last_signals[sym] != "⚠️ Strong Sell":
-            if virtual_wallet[sym] > 0:
-                value = virtual_wallet[sym] * price
-                virtual_wallet["USDT"] += value
-                virtual_wallet[sym] = 0.0
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"SELL {sym} @ {price}")
-                last_signals[sym] = "⚠️ Strong Sell"
+    ema20 = ema(closes[-20:], 20)
+    ema50 = ema(closes[-50:], 50)
+    rsi = calculate_rsi(closes)
+    macd_val = macd(closes)
 
-async def main():
-    application = Application.builder().token(TOKEN).build()
+    vol_avg = sum(volumes[-20:]) / 20
 
-    application.add_handler(CommandHandler("price", price_command))
-    application.add_handler(CommandHandler("wallet", wallet_command))
+    if ema20 > ema50 and macd_val > 0 and rsi > 50 and volumes[-1] > vol_avg:
+        return price, "BUY"
 
-    # ✅ الحل هنا
-    job_queue = application.job_queue
-    job_queue.run_repeating(monitor_logic, interval=60, first=10)
+    elif ema20 < ema50 and macd_val < 0 and rsi < 50:
+        return price, "SELL"
 
-    print("Bot is running...")
-    await application.run_polling()
+    return price, "Neutral"
+
+# ================= Risk =================
+
+def position_size(price):
+    risk_amount = virtual_wallet["USDT"] * RISK_PER_TRADE
+    return risk_amount / price
+
+def trailing_stop_check(symbol, price):
+    if virtual_wallet[symbol] == 0:
+        return False
+
+    if highest_price[symbol] is None or price > highest_price[symbol]:
+        highest_price[symbol] = price
+
+    if price <= highest_price[symbol] * (1 - TRAILING_STOP):
+        close_trade(symbol, price, "🔻 TRAILING STOP")
+        return True
+
+    return False
+
+def close_trade(symbol, price, reason):
+    value = virtual_wallet[symbol] * price
+    virtual_wallet["USDT"] += value
+
+    virtual_wallet[symbol] = 0
+    entry_price[symbol] = None
+    highest_price[symbol] = None
+
+    send_message(f"{reason} {symbol} @ {price}")
+
+# ================= Dashboard =================
+
+def report():
+    msg = f"💼 Balance: {virtual_wallet['USDT']:.2f} USDT"
+    send_message(msg)
+
+# ================= Main =================
+
+def run_bot():
+    print("PRO BOT 🔥")
+
+    counter = 0
+
+    while True:
+        for sym in SYMBOLS:
+            price, signal = get_analysis(sym)
+
+            if trailing_stop_check(sym, price):
+                continue
+
+            if signal == last_signal[sym]:
+                continue
+
+            if signal == "BUY" and virtual_wallet[sym] == 0:
+                qty = position_size(price)
+                cost = qty * price
+
+                if virtual_wallet["USDT"] >= cost:
+                    virtual_wallet[sym] = qty
+                    virtual_wallet["USDT"] -= cost
+                    entry_price[sym] = price
+                    highest_price[sym] = price
+
+                    send_message(f"🚀 BUY {sym} @ {price}")
+
+            elif signal == "SELL" and virtual_wallet[sym] > 0:
+                close_trade(sym, price, "⚠️ SELL")
+
+            last_signal[sym] = signal
+
+        counter += 1
+
+        if counter % 30 == 0:
+            report()
+
+        time.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_bot()
