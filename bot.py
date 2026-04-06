@@ -1,5 +1,5 @@
-import ccxt
 import os
+import ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -9,7 +9,6 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -20,7 +19,6 @@ exchange = ccxt.binance({
 })
 
 # ================= WALLET =================
-
 virtual_wallet = {"USDT": 10000.0}
 positions = {}
 entry_price = {}
@@ -29,9 +27,9 @@ trade_history = []
 wins = 0
 losses = 0
 
-RISK_PER_TRADE = 0.02
-STOP_LOSS = 0.02
-TAKE_PROFIT = 0.04
+RISK_PER_TRADE = 0.05  # الدخول بـ 5% من المحفظة في كل صفقة
+STOP_LOSS = 0.015      # وقف الخسارة 1.5%
+TAKE_PROFIT = 0.03     # أخذ الربح 3%
 
 # ================= INDICATORS =================
 
@@ -42,55 +40,89 @@ def ema(data, period):
         ema_val = price * k + ema_val * (1 - k)
     return ema_val
 
-def rsi(closes, period=14):
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
+def macd(closes):
+    macd_line = []
+    ema12 = [ema(closes[:i+1], 12) for i in range(len(closes))]
+    ema26 = [ema(closes[:i+1], 26) for i in range(len(closes))]
+    
+    for i in range(len(closes)):
+        macd_line.append(ema12[i] - ema26[i])
+        
+    signal_line = [ema(macd_line[:i+1], 9) for i in range(len(macd_line))]
+    return macd_line[-1], signal_line[-1]
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+# حساب مؤشر Parabolic SAR من الصفر لكي لا نحتاج مكتبات خارجية تعطل Render
+def calculate_sar(highs, lows, af=0.02, max_af=0.2):
+    sar = [0.0] * len(highs)
+    is_long = True
+    ep = highs[0]
+    cur_af = af
+    sar[0] = lows[0] - (highs[0] - lows[0])
+    
+    for i in range(1, len(highs)):
+        sar[i] = sar[i-1] + cur_af * (ep - sar[i-1])
+        if is_long:
+            if lows[i] < sar[i]:
+                is_long = False
+                sar[i] = ep
+                ep = lows[i]
+                cur_af = af
+            else:
+                if highs[i] > ep:
+                    ep = highs[i]
+                    cur_af = min(cur_af + af, max_af)
+                sar[i] = min(sar[i], lows[i-1])
+                if i > 1: sar[i] = min(sar[i], lows[i-2])
+        else:
+            if highs[i] > sar[i]:
+                is_long = True
+                sar[i] = ep
+                ep = highs[i]
+                cur_af = af
+            else:
+                if lows[i] < ep:
+                    ep = lows[i]
+                    cur_af = min(cur_af + af, max_af)
+                sar[i] = max(sar[i], highs[i-1])
+                if i > 1: sar[i] = max(sar[i], highs[i-2])
+    return sar[-1]
 
 # ================= STRATEGY =================
 
 def get_signal(symbol):
     try:
+        # الفريم 5 دقائق لنلتقط صفقات أسرع
         bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
-        bars = bars[:-1]
+        bars = bars[:-1] # استبعاد الشمعة الحالية غير المكتملة
 
         closes = [b[4] for b in bars]
-        volumes = [b[5] for b in bars]
-
+        highs = [b[2] for b in bars]
+        lows = [b[3] for b in bars]
+        
         price = closes[-1]
+        
+        # المؤشرات
+        ema50 = ema(closes, 50)
+        sar_val = calculate_sar(highs, lows)
+        macd_val, macd_signal = macd(closes)
 
-        ema50 = ema(closes[-50:], 50)
-        ema200 = ema(closes[-100:], 100)
+        # ====== شروط الشراء (مخففة ومنطقية) ======
+        # 1. السعر فوق متوسط 50 (ترند صاعد)
+        # 2. نقطة SAR تحت السعر (إشارة صعود)
+        # 3. خط الماكد فوق خط الإشارة (زخم إيجابي)
+        if price > ema50 and sar_val < price and macd_val > macd_signal:
+            return price, "BUY", sar_val
 
-        rsi_val = rsi(closes)
-        vol_avg = sum(volumes[-20:]) / 20
+        # ====== شروط البيع / الخروج ======
+        # إذا انعكس SAR وأصبح فوق السعر (إشارة هبوط)
+        if sar_val > price:
+            return price, "SELL", sar_val
 
-        # BUY
-        if price > ema50 and ema50 > ema200:
-            if abs(price - ema50) / ema50 < 0.003:
-                if 45 < rsi_val < 60 and volumes[-1] > vol_avg:
-                    return price, "BUY"
-
-        # SELL (trend break)
-        if price < ema50:
-            return price, "SELL"
-
-        return price, "HOLD"
+        return price, "HOLD", sar_val
 
     except Exception as e:
-        print(f"Error: {e}")
-        return None, "HOLD"
+        print(f"Error fetching data for {symbol}: {e}")
+        return None, "HOLD", None
 
 # ================= TRADING =================
 
@@ -99,66 +131,69 @@ def position_size(price):
 
 def close_trade(symbol, price):
     global wins, losses
-
     qty = positions[symbol]
     entry = entry_price[symbol]
-
+    
     pnl = (price - entry) * qty
     virtual_wallet["USDT"] += qty * price
-
-    if pnl > 0:
-        wins += 1
-    else:
-        losses += 1
-
+    
+    if pnl > 0: wins += 1
+    else: losses += 1
+        
     trade_history.append(pnl)
-
     positions.pop(symbol)
     entry_price.pop(symbol)
+    return pnl
 
-# ================= JOB =================
+# ================= JOB QUEUE =================
 
 async def trading_job(context: ContextTypes.DEFAULT_TYPE):
     if not CHAT_ID:
         return
 
     for sym in SYMBOLS:
-        price, signal = get_signal(sym)
+        price, signal, sar_val = get_signal(sym)
         if not price:
             continue
 
-        # BUY
+        # فحص الشراء إذا لم نكن نمتلك العملة
         if signal == "BUY" and sym not in positions:
             qty = position_size(price)
             cost = qty * price
-
+            
             if virtual_wallet["USDT"] >= cost:
                 positions[sym] = qty
                 entry_price[sym] = price
                 virtual_wallet["USDT"] -= cost
+                
+                msg = f"🟢 **BUY OPENED** 🟢\n" \
+                      f"🪙 Coin: {sym}\n" \
+                      f"💵 Price: {price:.2f} $\n" \
+                      f"🎯 TP: {(price * (1 + TAKE_PROFIT)):.2f} $\n" \
+                      f"🛑 SL: {(price * (1 - STOP_LOSS)):.2f} $"
+                await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🚀 BUY {sym}\n💰 Price: {price}"
-                )
-
-        # SELL / SL / TP
+        # فحص البيع (وقف الخسارة، أخذ الربح، أو إشارة عكسية من SAR)
         if sym in positions:
             entry = entry_price[sym]
-
+            
+            # ضرب وقف الخسارة
             if price <= entry * (1 - STOP_LOSS):
-                close_trade(sym, price)
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"🛑 STOP LOSS {sym}")
-
+                pnl = close_trade(sym, price)
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"🛑 **STOP LOSS HIT**\n🪙 {sym} closed at {price:.2f} $\n📉 PnL: {pnl:.2f} $")
+            
+            # ضرب أخذ الربح
             elif price >= entry * (1 + TAKE_PROFIT):
-                close_trade(sym, price)
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"🎯 TAKE PROFIT {sym}")
-
+                pnl = close_trade(sym, price)
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"🎯 **TAKE PROFIT HIT**\n🪙 {sym} closed at {price:.2f} $\n📈 PnL: {pnl:.2f} $")
+            
+            # إشارة بيع من المؤشر (SAR انقلب للأعلى)
             elif signal == "SELL":
-                close_trade(sym, price)
-                await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ SELL {sym}")
+                pnl = close_trade(sym, price)
+                icon = "📈" if pnl > 0 else "📉"
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ **TREND REVERSED (SAR)**\n🪙 {sym} closed at {price:.2f} $\n{icon} PnL: {pnl:.2f} $")
 
-# ================= COMMANDS =================
+# ================= COMMANDS & BUTTONS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -166,7 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💼 Positions", callback_data="positions")]
     ]
     await update.message.reply_text(
-        "🤖 BOT V3 RUNNING",
+        "🤖 **SAR & EMA Bot Running!**\nالاستراتيجية تعمل بكفاءة وتبحث عن الفرص الآن...",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -183,19 +218,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Balance: {virtual_wallet['USDT']:.2f} USDT\n"
             f"📊 Trades: {total_trades}\n"
             f"✅ Wins: {wins} | ❌ Losses: {losses}\n"
-            f"📈 PnL: {pnl:.2f} USDT\n"
+            f"💵 Net PnL: {pnl:.2f} $\n"
             f"🎯 WinRate: {winrate:.1f}%"
         )
         await query.edit_message_text(msg)
 
     elif query.data == "positions":
         if not positions:
-            await query.edit_message_text("📭 No Open Positions")
+            await query.edit_message_text("📭 لا توجد صفقات مفتوحة حالياً.")
             return
 
-        msg = "💼 Positions:\n"
+        msg = "💼 **Active Positions:**\n\n"
         for sym, qty in positions.items():
-            msg += f"{sym}: {qty:.4f}\n"
+            entry = entry_price[sym]
+            msg += f"🪙 {sym}\n🔸 Qty: {qty:.4f}\n💵 Entry: {entry:.2f} $\n---\n"
         await query.edit_message_text(msg)
 
 # ================= MAIN =================
@@ -210,9 +246,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
+    # فحص السوق كل 60 ثانية
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    print("BOT V3 RUNNING 🚀")
+    print("BOT V4 (EMA + SAR + MACD) RUNNING 🚀")
+    
+    # التشغيل الآمن الخالي من التعليق
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
