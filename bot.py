@@ -27,7 +27,7 @@ trade_history = []
 wins = 0
 losses = 0
 
-RISK_PER_TRADE = 0.05  # الدخول بـ 5% من المحفظة في كل صفقة
+RISK_PER_TRADE = 0.05  # الدخول بـ 5% من المحفظة
 STOP_LOSS = 0.015      # وقف الخسارة 1.5%
 TAKE_PROFIT = 0.03     # أخذ الربح 3%
 
@@ -51,7 +51,6 @@ def macd(closes):
     signal_line = [ema(macd_line[:i+1], 9) for i in range(len(macd_line))]
     return macd_line[-1], signal_line[-1]
 
-# حساب مؤشر Parabolic SAR من الصفر لكي لا نحتاج مكتبات خارجية تعطل Render
 def calculate_sar(highs, lows, af=0.02, max_af=0.2):
     sar = [0.0] * len(highs)
     is_long = True
@@ -91,9 +90,9 @@ def calculate_sar(highs, lows, af=0.02, max_af=0.2):
 
 def get_signal(symbol):
     try:
-        # الفريم 5 دقائق لنلتقط صفقات أسرع
-        bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
-        bars = bars[:-1] # استبعاد الشمعة الحالية غير المكتملة
+        # فريم 1 دقيقة لفتح صفقات سريعة للتجربة
+        bars = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=100)
+        bars = bars[:-1] 
 
         closes = [b[4] for b in bars]
         highs = [b[2] for b in bars]
@@ -101,20 +100,16 @@ def get_signal(symbol):
         
         price = closes[-1]
         
-        # المؤشرات
         ema50 = ema(closes, 50)
         sar_val = calculate_sar(highs, lows)
-        macd_val, macd_signal = macd(closes)
 
-        # ====== شروط الشراء (مخففة ومنطقية) ======
-        # 1. السعر فوق متوسط 50 (ترند صاعد)
-        # 2. نقطة SAR تحت السعر (إشارة صعود)
-        # 3. خط الماكد فوق خط الإشارة (زخم إيجابي)
-        if price > ema50 and sar_val < price and macd_val > macd_signal:
+        # ====== شروط الشراء (مخففة جداً للتجربة) ======
+        # السعر أعلى من الـ EMA 50 و نقطة الـ SAR أسفل السعر
+        if price > ema50 and sar_val < price:
             return price, "BUY", sar_val
 
         # ====== شروط البيع / الخروج ======
-        # إذا انعكس SAR وأصبح فوق السعر (إشارة هبوط)
+        # نقطة الـ SAR أصبحت أعلى السعر
         if sar_val > price:
             return price, "SELL", sar_val
 
@@ -156,7 +151,6 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
         if not price:
             continue
 
-        # فحص الشراء إذا لم نكن نمتلك العملة
         if signal == "BUY" and sym not in positions:
             qty = position_size(price)
             cost = qty * price
@@ -166,28 +160,24 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                 entry_price[sym] = price
                 virtual_wallet["USDT"] -= cost
                 
-                msg = f"🟢 **BUY OPENED** 🟢\n" \
+                msg = f"🟢 **TEST BUY OPENED** 🟢\n" \
                       f"🪙 Coin: {sym}\n" \
                       f"💵 Price: {price:.2f} $\n" \
                       f"🎯 TP: {(price * (1 + TAKE_PROFIT)):.2f} $\n" \
                       f"🛑 SL: {(price * (1 - STOP_LOSS)):.2f} $"
                 await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-        # فحص البيع (وقف الخسارة، أخذ الربح، أو إشارة عكسية من SAR)
         if sym in positions:
             entry = entry_price[sym]
             
-            # ضرب وقف الخسارة
             if price <= entry * (1 - STOP_LOSS):
                 pnl = close_trade(sym, price)
                 await context.bot.send_message(chat_id=CHAT_ID, text=f"🛑 **STOP LOSS HIT**\n🪙 {sym} closed at {price:.2f} $\n📉 PnL: {pnl:.2f} $")
             
-            # ضرب أخذ الربح
             elif price >= entry * (1 + TAKE_PROFIT):
                 pnl = close_trade(sym, price)
                 await context.bot.send_message(chat_id=CHAT_ID, text=f"🎯 **TAKE PROFIT HIT**\n🪙 {sym} closed at {price:.2f} $\n📈 PnL: {pnl:.2f} $")
             
-            # إشارة بيع من المؤشر (SAR انقلب للأعلى)
             elif signal == "SELL":
                 pnl = close_trade(sym, price)
                 icon = "📈" if pnl > 0 else "📉"
@@ -201,7 +191,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💼 Positions", callback_data="positions")]
     ]
     await update.message.reply_text(
-        "🤖 **SAR & EMA Bot Running!**\nالاستراتيجية تعمل بكفاءة وتبحث عن الفرص الآن...",
+        "🤖 **Fast Test Bot Running! (1m timeframe)**\nالبوت يعمل الآن بالوضع السريع للتجربة، ترقب الإشارات...",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -246,12 +236,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # فحص السوق كل 60 ثانية
+    # فحص السوق كل دقيقة ليتناسب مع التعديل السريع
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    print("BOT V4 (EMA + SAR + MACD) RUNNING 🚀")
+    print("BOT V4 (FAST TEST MODE) RUNNING 🚀")
     
-    # التشغيل الآمن الخالي من التعليق
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
