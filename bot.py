@@ -1,6 +1,5 @@
 import ccxt
 import os
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,24 +15,23 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
-exchange = ccxt.binance()
+exchange = ccxt.binance({
+    "enableRateLimit": True
+})
+
+# ================= WALLET =================
 
 virtual_wallet = {"USDT": 10000.0}
-for s in SYMBOLS:
-    virtual_wallet[s] = 0.0
+positions = {}
+entry_price = {}
 
-entry_price = {s: None for s in SYMBOLS}
-highest_price = {s: None for s in SYMBOLS}
-last_signal = {s: None for s in SYMBOLS}
-
-# 🔥 إدارة المخاطر
-RISK_PER_TRADE = 0.02
-STOP_LOSS = 0.01
-TAKE_PROFIT = 0.02
-TRAILING_STOP = 0.03
-
-# 📊 سجل الصفقات
 trade_history = []
+wins = 0
+losses = 0
+
+RISK_PER_TRADE = 0.02
+STOP_LOSS = 0.02
+TAKE_PROFIT = 0.04
 
 # ================= INDICATORS =================
 
@@ -44,10 +42,10 @@ def ema(data, period):
         ema_val = price * k + ema_val * (1 - k)
     return ema_val
 
-def calculate_rsi(closes, period=14):
+def rsi(closes, period=14):
     gains, losses = [], []
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
+        diff = closes[i] - closes[i-1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
 
@@ -60,200 +58,162 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ================= ANALYSIS =================
+# ================= STRATEGY =================
 
-def get_analysis(symbol):
+def get_signal(symbol):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=200)
+        bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
         bars = bars[:-1]
 
         closes = [b[4] for b in bars]
-        highs = [b[2] for b in bars]
-        lows = [b[3] for b in bars]
+        volumes = [b[5] for b in bars]
 
         price = closes[-1]
 
-        ema20 = ema(closes[-20:], 20)
         ema50 = ema(closes[-50:], 50)
-        ema100 = ema(closes[-100:], 100)
-        ema200 = ema(closes[-200:], 200)
+        ema200 = ema(closes[-100:], 100)
 
-        rsi = calculate_rsi(closes)
-
-        sar = min(lows[-2:])
+        rsi_val = rsi(closes)
+        vol_avg = sum(volumes[-20:]) / 20
 
         # BUY
-        if ema20 > ema50 > ema100 > ema200 and price > ema20 and sar < price and 50 < rsi < 65:
-            return price, "BUY"
+        if price > ema50 and ema50 > ema200:
+            if abs(price - ema50) / ema50 < 0.003:
+                if 45 < rsi_val < 60 and volumes[-1] > vol_avg:
+                    return price, "BUY"
 
-        # SELL
-        elif ema20 < ema50 < ema100 < ema200 and price < ema20 and sar > price and 35 < rsi < 50:
+        # SELL (trend break)
+        if price < ema50:
             return price, "SELL"
 
-        return price, "NEUTRAL"
+        return price, "HOLD"
 
     except Exception as e:
-        print(f"ANALYSIS ERROR {symbol}: {e}")
-        return None, "NEUTRAL"
+        print(f"Error: {e}")
+        return None, "HOLD"
 
-# ================= TRADE =================
+# ================= TRADING =================
 
 def position_size(price):
-    risk_amount = virtual_wallet["USDT"] * RISK_PER_TRADE
-    return risk_amount / price
-
-def record_trade(symbol, entry, exit_price):
-    profit = (exit_price - entry) / entry
-    trade_history.append({
-        "symbol": symbol,
-        "entry": entry,
-        "exit": exit_price,
-        "profit": profit,
-        "time": datetime.now().strftime("%H:%M")
-    })
+    return (virtual_wallet["USDT"] * RISK_PER_TRADE) / price
 
 def close_trade(symbol, price):
+    global wins, losses
+
+    qty = positions[symbol]
     entry = entry_price[symbol]
 
-    value = virtual_wallet[symbol] * price
-    virtual_wallet["USDT"] += value
-    virtual_wallet[symbol] = 0
+    pnl = (price - entry) * qty
+    virtual_wallet["USDT"] += qty * price
 
-    record_trade(symbol, entry, price)
+    if pnl > 0:
+        wins += 1
+    else:
+        losses += 1
 
-    entry_price[symbol] = None
-    highest_price[symbol] = None
+    trade_history.append(pnl)
 
-# ================= BOT =================
+    positions.pop(symbol)
+    entry_price.pop(symbol)
+
+# ================= JOB =================
 
 async def trading_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not CHAT_ID:
-            return
+    if not CHAT_ID:
+        return
 
-        for sym in SYMBOLS:
-            price, signal = get_analysis(sym)
-            if not price:
-                continue
+    for sym in SYMBOLS:
+        price, signal = get_signal(sym)
+        if not price:
+            continue
 
-            # 🔥 إدارة الصفقة
-            if virtual_wallet[sym] > 0:
-                entry = entry_price[sym]
+        # BUY
+        if signal == "BUY" and sym not in positions:
+            qty = position_size(price)
+            cost = qty * price
 
-                # تحديث أعلى سعر
-                if highest_price[sym] is None or price > highest_price[sym]:
-                    highest_price[sym] = price
+            if virtual_wallet["USDT"] >= cost:
+                positions[sym] = qty
+                entry_price[sym] = price
+                virtual_wallet["USDT"] -= cost
 
-                # Stop Loss
-                if price <= entry * (1 - STOP_LOSS):
-                    close_trade(sym, price)
-                    await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ STOP LOSS {sym}")
-                    continue
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"🚀 BUY {sym}\n💰 Price: {price}"
+                )
 
-                # Take Profit
-                if price >= entry * (1 + TAKE_PROFIT):
-                    close_trade(sym, price)
-                    await context.bot.send_message(chat_id=CHAT_ID, text=f"💰 TAKE PROFIT {sym}")
-                    continue
+        # SELL / SL / TP
+        if sym in positions:
+            entry = entry_price[sym]
 
-                # Trailing Stop
-                if price < highest_price[sym] * (1 - TRAILING_STOP):
-                    close_trade(sym, price)
-                    await context.bot.send_message(chat_id=CHAT_ID, text=f"🔻 TRAILING STOP {sym}")
-                    continue
+            if price <= entry * (1 - STOP_LOSS):
+                close_trade(sym, price)
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"🛑 STOP LOSS {sym}")
 
-            if signal == last_signal[sym]:
-                continue
+            elif price >= entry * (1 + TAKE_PROFIT):
+                close_trade(sym, price)
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"🎯 TAKE PROFIT {sym}")
 
-            # BUY
-            if signal == "BUY" and virtual_wallet[sym] == 0:
-                qty = position_size(price)
-                cost = qty * price
-
-                if virtual_wallet["USDT"] >= cost:
-                    virtual_wallet[sym] = qty
-                    virtual_wallet["USDT"] -= cost
-                    entry_price[sym] = price
-                    highest_price[sym] = price
-
-                    await context.bot.send_message(chat_id=CHAT_ID, text=f"🚀 BUY {sym} @ {price}")
-
-            # SELL
-            elif signal == "SELL" and virtual_wallet[sym] > 0:
+            elif signal == "SELL":
                 close_trade(sym, price)
                 await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ SELL {sym}")
 
-            last_signal[sym] = signal
-
-    except Exception as e:
-        print("JOB ERROR:", e)
-
-# ================= STATS =================
-
-def get_stats():
-    total = len(trade_history)
-    wins = sum(1 for t in trade_history if t["profit"] > 0)
-    losses = total - wins
-
-    pnl = sum(t["profit"] for t in trade_history) * 100
-
-    winrate = (wins / total * 100) if total > 0 else 0
-
-    return total, wins, losses, pnl, winrate
-
-# ================= UI =================
+# ================= COMMANDS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="stats")],
         [InlineKeyboardButton("💼 Positions", callback_data="positions")]
     ]
-    await update.message.reply_text("🤖 BOT PRO READY 🚀", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "🤖 BOT V3 RUNNING",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if query.data == "stats":
-        total, wins, losses, pnl, winrate = get_stats()
-        balance = virtual_wallet["USDT"]
+        total_trades = wins + losses
+        winrate = (wins / total_trades * 100) if total_trades > 0 else 0
+        pnl = sum(trade_history)
 
-        text = (
-            f"💰 Balance: {balance:.2f} USDT\n"
-            f"📊 Trades: {total}\n"
+        msg = (
+            f"💰 Balance: {virtual_wallet['USDT']:.2f} USDT\n"
+            f"📊 Trades: {total_trades}\n"
             f"✅ Wins: {wins} | ❌ Losses: {losses}\n"
-            f"📈 PnL: {pnl:.2f}%\n"
+            f"📈 PnL: {pnl:.2f} USDT\n"
             f"🎯 WinRate: {winrate:.1f}%"
         )
-        await query.edit_message_text(text)
+        await query.edit_message_text(msg)
 
     elif query.data == "positions":
-        msg = "📊 Positions:\n"
-        for sym in SYMBOLS:
-            msg += f"{sym}: {virtual_wallet[sym]:.4f}\n"
+        if not positions:
+            await query.edit_message_text("📭 No Open Positions")
+            return
+
+        msg = "💼 Positions:\n"
+        for sym, qty in positions.items():
+            msg += f"{sym}: {qty:.4f}\n"
         await query.edit_message_text(msg)
 
 # ================= MAIN =================
 
 def main():
-    try:
-        if not TOKEN:
-            print("❌ TOKEN NOT FOUND")
-            return
+    if not TOKEN:
+        print("❌ TELEGRAM_TOKEN missing")
+        return
 
-        app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-        app.job_queue.run_repeating(trading_job, interval=60, first=5)
+    app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-        print("✅ BOT PRO RUNNING")
-
-        app.run_polling(drop_pending_updates=True)
-
-    except Exception as e:
-        print("🔥 CRASH:", e)
+    print("BOT V3 RUNNING 🚀")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
