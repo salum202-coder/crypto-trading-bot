@@ -16,11 +16,11 @@ ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
-# التعديل السحري: غيرنا المنصة إلى KuCoin لتجنب حظر السيرفرات الأمريكية
 exchange = ccxt.kucoin({
     "enableRateLimit": True
 })
 
+# تصفير المحفظة للبدء مع الاستراتيجية الجديدة
 virtual_wallet = {"USDT": 10000.0}
 positions = {}
 entry_price = {}
@@ -78,10 +78,11 @@ def calculate_sar(highs, lows, af=0.02, max_af=0.2):
                 if i > 1: sar[i] = max(sar[i], highs[i-2])
     return sar[-1]
 
-# ================= STRATEGY =================
+# ================= STRATEGY (وضع القناص) =================
 def get_signal(symbol):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=100)
+        # فريم 15 دقيقة لفلترة التذبذبات الوهمية والبحث عن ترند حقيقي
+        bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
         bars = bars[:-1] 
 
         closes = [b[4] for b in bars]
@@ -90,11 +91,18 @@ def get_signal(symbol):
         
         price = closes[-1]
         ema50 = ema(closes, 50)
+        ema20 = ema(closes, 20) # متوسط إضافي لتأكيد الزخم
         sar_val = calculate_sar(highs, lows)
 
-        if price > ema50 and sar_val < price:
+        # ====== شروط الشراء (صارمة ومدروسة) ======
+        # 1. السعر أعلى من EMA50
+        # 2. خط EMA20 السريع أعلى من خط EMA50 (تأكيد قوة الاتجاه)
+        # 3. نقطة SAR أسفل السعر
+        if price > ema50 and ema20 > ema50 and sar_val < price:
             return price, "BUY", sar_val, ema50
 
+        # ====== شروط البيع / الخروج ======
+        # إذا انقلبت نقطة SAR وأصبحت فوق السعر
         if sar_val > price:
             return price, "SELL", sar_val, ema50
 
@@ -145,7 +153,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                 entry_price[sym] = price
                 virtual_wallet["USDT"] -= cost
                 
-                msg = f"🟢 **TEST BUY OPENED** 🟢\n🪙 Coin: {sym}\n💵 Price: {price:.2f} $\n🎯 TP: {(price * (1 + TAKE_PROFIT)):.2f} $\n🛑 SL: {(price * (1 - STOP_LOSS)):.2f} $"
+                msg = f"🟢 **SNIPER BUY OPENED** 🟢\n🪙 Coin: {sym}\n💵 Price: {price:.2f} $\n🎯 TP: {(price * (1 + TAKE_PROFIT)):.2f} $\n🛑 SL: {(price * (1 - STOP_LOSS)):.2f} $"
                 await context.bot.send_message(chat_id=active_chat_id, text=msg)
 
         if sym in positions:
@@ -174,7 +182,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "✅ **تم الربط بنجاح!**\nالبوت مستقر الآن. اضغط على 'فحص السوق الآن' لترى المؤشرات مباشرة:",
+        "✅ **تم الربط بنجاح!**\nالبوت يعمل الآن كـ 'قناص' (15m). اضغط على 'فحص السوق الآن' لترى المؤشرات:",
         reply_markup=get_main_keyboard()
     )
 
@@ -183,7 +191,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "scan":
-        msg = "📡 **رادار السوق المباشر (1m):**\n\n"
+        msg = "📡 **رادار السوق المباشر (15m):**\n\n"
         for sym in SYMBOLS:
             price, signal, sar_val, ema50 = get_signal(sym)
             if price:
@@ -237,7 +245,7 @@ def main():
 
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    print("🚀 BOT STARTED SUCCESSFULLY (KuCoin)...")
+    print("🚀 BOT STARTED SUCCESSFULLY (Sniper Mode 15m)...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
