@@ -16,7 +16,8 @@ ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
-exchange = ccxt.binance({
+# التعديل السحري: غيرنا المنصة إلى KuCoin لتجنب حظر السيرفرات الأمريكية
+exchange = ccxt.kucoin({
     "enableRateLimit": True
 })
 
@@ -80,7 +81,6 @@ def calculate_sar(highs, lows, af=0.02, max_af=0.2):
 # ================= STRATEGY =================
 def get_signal(symbol):
     try:
-        # فريم 1 دقيقة للتجربة السريعة
         bars = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=100)
         bars = bars[:-1] 
 
@@ -92,11 +92,9 @@ def get_signal(symbol):
         ema50 = ema(closes, 50)
         sar_val = calculate_sar(highs, lows)
 
-        # شروط شراء سريعة
         if price > ema50 and sar_val < price:
             return price, "BUY", sar_val, ema50
 
-        # شروط البيع
         if sar_val > price:
             return price, "SELL", sar_val, ema50
 
@@ -174,7 +172,6 @@ def get_main_keyboard():
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # حفظ الـ ID فوراً بمجرد الضغط على ستارت
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
         "✅ **تم الربط بنجاح!**\nالبوت مستقر الآن. اضغط على 'فحص السوق الآن' لترى المؤشرات مباشرة:",
@@ -213,7 +210,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"🪙 {sym}\n💵 Entry: {entry_price[sym]:.2f} $\n---\n"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
-# ================= DUMMY SERVER (لخداع Render) =================
+# ================= DUMMY SERVER =================
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -240,7 +237,7 @@ def main():
 
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    print("🚀 BOT STARTED SUCCESSFULLY...")
+    print("🚀 BOT STARTED SUCCESSFULLY (KuCoin)...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
