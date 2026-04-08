@@ -14,22 +14,26 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+# توسيع القائمة إلى 10 عملات من أقوى مشاريع السوق
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 
+    'XRP/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOGE/USDT', 
+    'LINK/USDT', 'DOT/USDT'
+]
 
 exchange = ccxt.kucoin({
     "enableRateLimit": True
 })
 
-# تصفير المحفظة للبدء مع الاستراتيجية الجديدة
-virtual_wallet = {"USDT": 10000.0}
-positions = {}
-entry_price = {}
+# المحفظة الواقعية 130 دولار مع دخول بـ 15% للصفقة
+virtual_wallet = {"USDT": 130.0}
+positions = {} # شكلها الجديد: {'BTC/USDT': {'qty': 0.5, 'entry': 70000, 'type': 'LONG'}}
 
 trade_history = []
 wins = 0
 losses = 0
 
-RISK_PER_TRADE = 0.05
+RISK_PER_TRADE = 0.15  # 15% من الـ 130 دولار
 STOP_LOSS = 0.015
 TAKE_PROFIT = 0.03
 
@@ -78,10 +82,9 @@ def calculate_sar(highs, lows, af=0.02, max_af=0.2):
                 if i > 1: sar[i] = max(sar[i], highs[i-2])
     return sar[-1]
 
-# ================= STRATEGY (وضع القناص) =================
+# ================= STRATEGY =================
 def get_signal(symbol):
     try:
-        # فريم 15 دقيقة لفلترة التذبذبات الوهمية والبحث عن ترند حقيقي
         bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
         bars = bars[:-1] 
 
@@ -91,20 +94,16 @@ def get_signal(symbol):
         
         price = closes[-1]
         ema50 = ema(closes, 50)
-        ema20 = ema(closes, 20) # متوسط إضافي لتأكيد الزخم
+        ema20 = ema(closes, 20) 
         sar_val = calculate_sar(highs, lows)
 
-        # ====== شروط الشراء (صارمة ومدروسة) ======
-        # 1. السعر أعلى من EMA50
-        # 2. خط EMA20 السريع أعلى من خط EMA50 (تأكيد قوة الاتجاه)
-        # 3. نقطة SAR أسفل السعر
+        # شروط صفقة الشراء (LONG)
         if price > ema50 and ema20 > ema50 and sar_val < price:
-            return price, "BUY", sar_val, ema50
+            return price, "LONG", sar_val, ema50
 
-        # ====== شروط البيع / الخروج ======
-        # إذا انقلبت نقطة SAR وأصبحت فوق السعر
-        if sar_val > price:
-            return price, "SELL", sar_val, ema50
+        # شروط صفقة البيع (SHORT) - التربح من الهبوط
+        if price < ema50 and ema20 < ema50 and sar_val > price:
+            return price, "SHORT", sar_val, ema50
 
         return price, "HOLD", sar_val, ema50
 
@@ -118,59 +117,87 @@ def position_size(price):
 
 def close_trade(symbol, price):
     global wins, losses
-    qty = positions[symbol]
-    entry = entry_price[symbol]
+    pos = positions[symbol]
+    qty = pos['qty']
+    entry = pos['entry']
+    pos_type = pos['type']
     
-    pnl = (price - entry) * qty
-    virtual_wallet["USDT"] += qty * price
+    # حساب الربح/الخسارة بناءً على نوع الصفقة
+    if pos_type == 'LONG':
+        pnl = (price - entry) * qty
+    else: # SHORT
+        pnl = (entry - price) * qty
+        
+    cost = qty * entry
+    virtual_wallet["USDT"] += (cost + pnl) # إعادة الكاش للمحفظة مع الأرباح/الخسائر
     
     if pnl > 0: wins += 1
     else: losses += 1
         
     trade_history.append(pnl)
     positions.pop(symbol)
-    entry_price.pop(symbol)
     return pnl
 
 # ================= JOB QUEUE =================
 async def trading_job(context: ContextTypes.DEFAULT_TYPE):
     active_chat_id = context.bot_data.get("chat_id") or ENV_CHAT_ID
-    
-    if not active_chat_id:
-        return
+    if not active_chat_id: return
 
     for sym in SYMBOLS:
         price, signal, sar_val, ema50 = get_signal(sym)
-        if not price:
-            continue
+        if not price: continue
 
-        if signal == "BUY" and sym not in positions:
-            qty = position_size(price)
-            cost = qty * price
-            
-            if virtual_wallet["USDT"] >= cost:
-                positions[sym] = qty
-                entry_price[sym] = price
-                virtual_wallet["USDT"] -= cost
-                
-                msg = f"🟢 **SNIPER BUY OPENED** 🟢\n🪙 Coin: {sym}\n💵 Price: {price:.2f} $\n🎯 TP: {(price * (1 + TAKE_PROFIT)):.2f} $\n🛑 SL: {(price * (1 - STOP_LOSS)):.2f} $"
-                await context.bot.send_message(chat_id=active_chat_id, text=msg)
-
+        # إذا كنا نملك صفقة في هذه العملة
         if sym in positions:
-            entry = entry_price[sym]
+            pos = positions[sym]
+            entry = pos['entry']
+            pos_type = pos['type']
             
-            if price <= entry * (1 - STOP_LOSS):
-                pnl = close_trade(sym, price)
-                await context.bot.send_message(chat_id=active_chat_id, text=f"🛑 **STOP LOSS HIT**\n🪙 {sym} closed at {price:.2f} $\n📉 PnL: {pnl:.2f} $")
-            
-            elif price >= entry * (1 + TAKE_PROFIT):
-                pnl = close_trade(sym, price)
-                await context.bot.send_message(chat_id=active_chat_id, text=f"🎯 **TAKE PROFIT HIT**\n🪙 {sym} closed at {price:.2f} $\n📈 PnL: {pnl:.2f} $")
-            
-            elif signal == "SELL":
-                pnl = close_trade(sym, price)
-                icon = "📈" if pnl > 0 else "📉"
-                await context.bot.send_message(chat_id=active_chat_id, text=f"⚠️ **TREND REVERSED (SAR)**\n🪙 {sym} closed at {price:.2f} $\n{icon} PnL: {pnl:.2f} $")
+            if pos_type == "LONG":
+                if price <= entry * (1 - STOP_LOSS):
+                    pnl = close_trade(sym, price)
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"🛑 **SL HIT (LONG)**\n🪙 {sym} closed at {price:.4f} $\n📉 PnL: {pnl:.2f} $")
+                elif price >= entry * (1 + TAKE_PROFIT):
+                    pnl = close_trade(sym, price)
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"🎯 **TP HIT (LONG)**\n🪙 {sym} closed at {price:.4f} $\n📈 PnL: {pnl:.2f} $")
+                elif sar_val > price:
+                    pnl = close_trade(sym, price)
+                    icon = "📈" if pnl > 0 else "📉"
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"⚠️ **TREND REVERSED (Closed LONG)**\n🪙 {sym} closed at {price:.4f} $\n{icon} PnL: {pnl:.2f} $")
+
+            elif pos_type == "SHORT":
+                if price >= entry * (1 + STOP_LOSS): # السعر ارتفع (خسارة للشورت)
+                    pnl = close_trade(sym, price)
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"🛑 **SL HIT (SHORT)**\n🪙 {sym} closed at {price:.4f} $\n📉 PnL: {pnl:.2f} $")
+                elif price <= entry * (1 - TAKE_PROFIT): # السعر انخفض (ربح للشورت)
+                    pnl = close_trade(sym, price)
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"🎯 **TP HIT (SHORT)**\n🪙 {sym} closed at {price:.4f} $\n📈 PnL: {pnl:.2f} $")
+                elif sar_val < price:
+                    pnl = close_trade(sym, price)
+                    icon = "📈" if pnl > 0 else "📉"
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"⚠️ **TREND REVERSED (Closed SHORT)**\n🪙 {sym} closed at {price:.4f} $\n{icon} PnL: {pnl:.2f} $")
+
+        # إذا لم يكن لدينا صفقة، نبحث عن فرصة
+        else:
+            if signal in ["LONG", "SHORT"]:
+                qty = position_size(price)
+                cost = qty * price
+                
+                if virtual_wallet["USDT"] >= cost:
+                    positions[sym] = {'qty': qty, 'entry': price, 'type': signal}
+                    virtual_wallet["USDT"] -= cost
+                    
+                    if signal == "LONG":
+                        tp_price = price * (1 + TAKE_PROFIT)
+                        sl_price = price * (1 - STOP_LOSS)
+                        icon = "🟢 **LONG OPENED**"
+                    else:
+                        tp_price = price * (1 - TAKE_PROFIT)
+                        sl_price = price * (1 + STOP_LOSS)
+                        icon = "🔴 **SHORT OPENED**"
+                        
+                    msg = f"{icon}\n🪙 Coin: {sym}\n💵 Entry: {price:.4f} $\n🎯 TP: {tp_price:.4f} $\n🛑 SL: {sl_price:.4f} $"
+                    await context.bot.send_message(chat_id=active_chat_id, text=msg)
 
 # ================= COMMANDS & BUTTONS =================
 def get_main_keyboard():
@@ -182,7 +209,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "✅ **تم الربط بنجاح!**\nالبوت يعمل الآن كـ 'قناص' (15m). اضغط على 'فحص السوق الآن' لترى المؤشرات:",
+        "✅ **تم تحديث الوحش!**\nالبوت الآن يراقب 10 عملات ويفتح صفقات (LONG & SHORT).\n💰 الرصيد المبدئي: 130 USDT",
         reply_markup=get_main_keyboard()
     )
 
@@ -191,22 +218,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "scan":
-        msg = "📡 **رادار السوق المباشر (15m):**\n\n"
+        msg = "📡 **رادار السوق المباشر (10 عملات):**\n\n"
         for sym in SYMBOLS:
             price, signal, sar_val, ema50 = get_signal(sym)
             if price:
-                status = "✅ يشتري الآن" if signal == "BUY" else "⏳ ننتظر الفرصة"
-                msg += f"🪙 {sym}\n💵 السعر: {price:.2f}\n📊 خط EMA50: {ema50:.2f}\n🎯 نقطة SAR: {sar_val:.2f}\n🤖 حالة البوت: {status}\n---\n"
+                if signal == "LONG": status = "🟢 فرصة صعود (LONG)"
+                elif signal == "SHORT": status = "🔴 فرصة هبوط (SHORT)"
+                else: status = "⏳ انتظار"
+                msg += f"🪙 {sym} | 🤖 {status}\n"
             else:
-                msg += f"⚠️ {sym}: جاري تحميل البيانات...\n---\n"
+                msg += f"⚠️ {sym}: جاري التحميل...\n"
         
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
     elif query.data == "stats":
         total_trades = wins + losses
-        winrate = (wins / total_trades * 100) if total_trades > 0 else 0
         pnl = sum(trade_history)
-        msg = f"💰 Balance: {virtual_wallet['USDT']:.2f} USDT\n📊 Trades: {total_trades}\n✅ Wins: {wins} | ❌ Losses: {losses}\n💵 Net PnL: {pnl:.2f} $"
+        
+        # حساب قيمة المحفظة الإجمالية (الكاش المتاح + قيمة الصفقات المفتوحة)
+        locked_margin = sum([pos['qty'] * pos['entry'] for pos in positions.values()])
+        total_value = virtual_wallet['USDT'] + locked_margin + pnl
+        
+        msg = f"💰 **Total Value:** {total_value:.2f} USDT\n💵 **Free Cash:** {virtual_wallet['USDT']:.2f} USDT\n📊 Trades: {total_trades}\n✅ Wins: {wins} | ❌ Losses: {losses}\n💸 Net PnL: {pnl:.2f} $"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
     elif query.data == "positions":
@@ -214,8 +247,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📭 لا توجد صفقات مفتوحة حالياً.", reply_markup=get_main_keyboard())
             return
         msg = "💼 **Active Positions:**\n\n"
-        for sym, qty in positions.items():
-            msg += f"🪙 {sym}\n💵 Entry: {entry_price[sym]:.2f} $\n---\n"
+        for sym, pos in positions.items():
+            icon = "🟢" if pos['type'] == "LONG" else "🔴"
+            msg += f"{icon} {sym} [{pos['type']}]\n💵 Entry: {pos['entry']:.4f} $\n---\n"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
 # ================= DUMMY SERVER =================
@@ -224,7 +258,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Hedge Fund Bot is running!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -245,7 +279,7 @@ def main():
 
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
 
-    print("🚀 BOT STARTED SUCCESSFULLY (Sniper Mode 15m)...")
+    print("🚀 BOT STARTED SUCCESSFULLY (LONG/SHORT - 10 COINS)...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
