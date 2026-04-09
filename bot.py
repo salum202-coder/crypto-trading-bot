@@ -22,7 +22,18 @@ SYMBOLS = [
     'LINK/USDT:USDT', 'DOT/USDT:USDT'
 ]
 
-# الاتصال بمنصة BingX
+# ================= TRADING SETTINGS =================
+RISK_PER_TRADE = 0.15  # الدخول بـ 15% من الرصيد المتاح
+LEVERAGE = 10          # الرافعة المالية 10x (لحل مشكلة الحد الأدنى للكميات)
+STOP_LOSS = 0.015      # وقف الخسارة (يعادل 15% من مبلغ الدخول الفعلي)
+TAKE_PROFIT = 0.03     # أخذ الربح (يعادل 30% من مبلغ الدخول الفعلي)
+
+trade_history = []
+wins = 0
+losses = 0
+positions_virtual = {} 
+
+# الاتصال بمنصة BingX وتحميل قوانين الأسواق (عشان الكسور)
 try:
     exchange = ccxt.bingx({
         'apiKey': BINGX_API_KEY,
@@ -32,19 +43,10 @@ try:
             'defaultType': 'swap' 
         }
     })
-    print("✅ Successfully connected to BingX API")
+    exchange.load_markets() # تحميل قوانين المنصة (الحدود الدنيا والكسور)
+    print("✅ Successfully connected to BingX API and loaded markets")
 except Exception as e:
     print(f"❌ Failed to connect to BingX: {e}")
-
-# ================= TRADING SETTINGS =================
-RISK_PER_TRADE = 0.15  
-STOP_LOSS = 0.015      
-TAKE_PROFIT = 0.03     
-
-trade_history = []
-wins = 0
-losses = 0
-positions_virtual = {} 
 
 # ================= INDICATORS =================
 def ema(data, period):
@@ -160,7 +162,6 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
 
             if close_signal:
                 try:
-                    # إضافة positionSide لحل مشكلة Hedge Mode عند الإغلاق
                     side = 'sell' if pos_type == 'LONG' else 'buy'
                     exchange.create_market_order(sym, side, qty, params={'positionSide': pos_type})
                     
@@ -178,24 +179,37 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
         # ================= فتح صفقات جديدة =================
         else:
             if signal in ["LONG", "SHORT"] and real_usdt_balance > 10: 
-                trade_amount_usdt = real_usdt_balance * RISK_PER_TRADE
-                qty = trade_amount_usdt / price
+                trade_margin = real_usdt_balance * RISK_PER_TRADE # المبلغ اللي بيسحبه من محفظتك (حوالي 20$)
+                position_size_usdt = trade_margin * LEVERAGE      # حجم الصفقة بعد الرافعة 10x (حوالي 200$)
+                raw_qty = position_size_usdt / price              # الكمية قبل الفلترة
                 
                 try:
-                    # إضافة positionSide لحل مشكلة Hedge Mode عند الفتح
+                    # فلترة الكمية لتتناسب مع قوانين BingX (الكسور الدقيقة)
+                    qty_str = exchange.amount_to_precision(sym, raw_qty)
+                    qty = float(qty_str)
+                except Exception:
+                    qty = round(raw_qty, 3) # خطة بديلة في حال فشل الفلتر
+                
+                try:
+                    # محاولة ضبط الرافعة المالية برمجياً أولاً
+                    try:
+                        exchange.set_leverage(LEVERAGE, sym)
+                    except:
+                        pass # بعض المنصات تضبطها تلقائياً ولا تحتاج أمر
+                    
+                    # إرسال الأمر المفلتر للسوق
                     side = 'buy' if signal == 'LONG' else 'sell'
                     order = exchange.create_market_order(sym, side, qty, params={'positionSide': signal})
                     
                     positions_virtual[sym] = {'qty': qty, 'entry': price, 'type': signal}
                     
                     icon = "🟢 **REAL LONG OPENED**" if signal == "LONG" else "🔴 **REAL SHORT OPENED**"
-                    msg = f"{icon}\n🪙 Coin: {sym.split(':')[0]}\n💵 Entry: {price:.4f} $\n💰 Size: {trade_amount_usdt:.2f} USDT"
+                    msg = f"{icon}\n🪙 Coin: {sym.split(':')[0]}\n💵 Entry: {price:.4f} $\n💼 Margin used: {trade_margin:.2f} $\n🚀 Position Size: {position_size_usdt:.2f} $"
                     await context.bot.send_message(chat_id=active_chat_id, text=msg)
                     
-                    real_usdt_balance -= trade_amount_usdt 
+                    real_usdt_balance -= trade_margin 
                     
                 except Exception as e:
-                    # رسالة الخطأ في التيليجرام في حال الرفض
                     await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Order failed for {sym.split(':')[0]}\nReason: {e}")
 
 # ================= COMMANDS =================
@@ -208,7 +222,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "🚨 **تم تحديث الوحش لحل مشكلة PositionSide!** 🚨\nالبوت الآن يرسل أوامره متوافقة مع شروط BingX 100%.",
+        "🚨 **تم تفعيل فلتر الكميات والرافعة المالية (10x)!** 🚨\nالبوت الآن قادر على فتح صفقات للعملات الكبيرة (مثل BTC و ETH).",
         reply_markup=get_main_keyboard()
     )
 
@@ -259,7 +273,7 @@ class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"REAL TRADING BOT IS RUNNING (BINGX FIXED)!")
+        self.wfile.write(b"REAL TRADING BOT IS RUNNING (PRECISION FIXED)!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
