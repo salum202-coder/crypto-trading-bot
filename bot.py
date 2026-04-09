@@ -10,31 +10,41 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
-# ================= CONFIG =================
+# ================= CONFIG & API =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINGX_API_KEY = os.getenv("BINGX_API_KEY")
+BINGX_SECRET = os.getenv("BINGX_SECRET")
 
 SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 
-    'XRP/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOGE/USDT', 
-    'LINK/USDT', 'DOT/USDT'
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 
+    'XRP/USDT:USDT', 'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'DOGE/USDT:USDT', 
+    'LINK/USDT:USDT', 'DOT/USDT:USDT'
 ]
 
-exchange = ccxt.kucoin({
-    "enableRateLimit": True
-})
+# الاتصال الفعلي بمنصة BingX (العقود الآجلة)
+try:
+    exchange = ccxt.bingx({
+        'apiKey': BINGX_API_KEY,
+        'secret': BINGX_SECRET,
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'swap' # تفعيل التداول على العقود الآجلة
+        }
+    })
+    print("✅ Successfully connected to BingX API")
+except Exception as e:
+    print(f"❌ Failed to connect to BingX: {e}")
 
-# المحفظة الواقعية 130 دولار
-virtual_wallet = {"USDT": 130.0}
-positions = {} 
+# ================= TRADING SETTINGS =================
+RISK_PER_TRADE = 0.15  # الدخول بـ 15% من الرصيد المتاح
+STOP_LOSS = 0.015      # وقف خسارة 1.5%
+TAKE_PROFIT = 0.03     # أخذ ربح 3%
 
 trade_history = []
 wins = 0
 losses = 0
-
-RISK_PER_TRADE = 0.15  # 15% للصفقة
-STOP_LOSS = 0.015
-TAKE_PROFIT = 0.03
+positions_virtual = {} # سنحتفظ بتتبع الصفقات المفتوحة برمجياً للسرعة
 
 # ================= INDICATORS =================
 def ema(data, period):
@@ -84,7 +94,6 @@ def calculate_sar(highs, lows, af=0.02, max_af=0.2):
 # ================= STRATEGY =================
 def get_signal(symbol):
     try:
-        # التعديل هنا: فريم 30 دقيقة
         bars = exchange.fetch_ohlcv(symbol, timeframe='30m', limit=100)
         bars = bars[:-1] 
 
@@ -106,105 +115,102 @@ def get_signal(symbol):
         return price, "HOLD", sar_val, ema50
 
     except Exception as e:
-        print(f"Error for {symbol}: {e}")
+        print(f"Error fetching data for {symbol}: {e}")
         return None, "HOLD", None, None
 
-# ================= TRADING =================
-def position_size(price):
-    return (virtual_wallet["USDT"] * RISK_PER_TRADE) / price
-
-def close_trade(symbol, price):
-    global wins, losses
-    pos = positions[symbol]
-    qty = pos['qty']
-    entry = pos['entry']
-    pos_type = pos['type']
-    
-    if pos_type == 'LONG':
-        pnl = (price - entry) * qty
-    else: 
-        pnl = (entry - price) * qty
-        
-    cost = qty * entry
-    virtual_wallet["USDT"] += (cost + pnl) 
-    
-    if pnl > 0: wins += 1
-    else: losses += 1
-        
-    trade_history.append(pnl)
-    positions.pop(symbol)
-    return pnl
+# ================= REAL MARKET EXECUTION =================
+def get_real_balance():
+    try:
+        balance = exchange.fetch_balance()
+        return balance['free'].get('USDT', 0) # جلب الكاش المتاح فعلياً
+    except Exception as e:
+        print(f"Balance error: {e}")
+        return 0
 
 # ================= JOB QUEUE =================
 async def trading_job(context: ContextTypes.DEFAULT_TYPE):
     active_chat_id = context.bot_data.get("chat_id") or ENV_CHAT_ID
     if not active_chat_id: return
 
+    real_usdt_balance = get_real_balance()
+
     for sym in SYMBOLS:
         price, signal, sar_val, ema50 = get_signal(sym)
         if not price: continue
 
-        if sym in positions:
-            pos = positions[sym]
+        # تتبع وإغلاق الصفقات المفتوحة
+        if sym in positions_virtual:
+            pos = positions_virtual[sym]
             entry = pos['entry']
             pos_type = pos['type']
+            qty = pos['qty']
             
+            close_signal = False
+            close_reason = ""
+
             if pos_type == "LONG":
-                if price <= entry * (1 - STOP_LOSS):
-                    pnl = close_trade(sym, price)
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"🛑 **SL HIT (LONG)**\n🪙 {sym} closed at {price:.4f} $\n📉 PnL: {pnl:.2f} $")
-                elif price >= entry * (1 + TAKE_PROFIT):
-                    pnl = close_trade(sym, price)
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"🎯 **TP HIT (LONG)**\n🪙 {sym} closed at {price:.4f} $\n📈 PnL: {pnl:.2f} $")
-                elif sar_val > price:
-                    pnl = close_trade(sym, price)
-                    icon = "📈" if pnl > 0 else "📉"
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"⚠️ **TREND REVERSED (Closed LONG)**\n🪙 {sym} closed at {price:.4f} $\n{icon} PnL: {pnl:.2f} $")
+                if price <= entry * (1 - STOP_LOSS): close_signal, close_reason = True, "🛑 SL HIT (LONG)"
+                elif price >= entry * (1 + TAKE_PROFIT): close_signal, close_reason = True, "🎯 TP HIT (LONG)"
+                elif sar_val > price: close_signal, close_reason = True, "⚠️ TREND REVERSED (LONG)"
 
             elif pos_type == "SHORT":
-                if price >= entry * (1 + STOP_LOSS): 
-                    pnl = close_trade(sym, price)
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"🛑 **SL HIT (SHORT)**\n🪙 {sym} closed at {price:.4f} $\n📉 PnL: {pnl:.2f} $")
-                elif price <= entry * (1 - TAKE_PROFIT): 
-                    pnl = close_trade(sym, price)
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"🎯 **TP HIT (SHORT)**\n🪙 {sym} closed at {price:.4f} $\n📈 PnL: {pnl:.2f} $")
-                elif sar_val < price:
-                    pnl = close_trade(sym, price)
-                    icon = "📈" if pnl > 0 else "📉"
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"⚠️ **TREND REVERSED (Closed SHORT)**\n🪙 {sym} closed at {price:.4f} $\n{icon} PnL: {pnl:.2f} $")
+                if price >= entry * (1 + STOP_LOSS): close_signal, close_reason = True, "🛑 SL HIT (SHORT)"
+                elif price <= entry * (1 - TAKE_PROFIT): close_signal, close_reason = True, "🎯 TP HIT (SHORT)"
+                elif sar_val < price: close_signal, close_reason = True, "⚠️ TREND REVERSED (SHORT)"
 
-        else:
-            if signal in ["LONG", "SHORT"]:
-                qty = position_size(price)
-                cost = qty * price
-                
-                if virtual_wallet["USDT"] >= cost:
-                    positions[sym] = {'qty': qty, 'entry': price, 'type': signal}
-                    virtual_wallet["USDT"] -= cost
+            if close_signal:
+                try:
+                    # إغلاق الصفقة في السوق الحقيقي
+                    side = 'sell' if pos_type == 'LONG' else 'buy'
+                    exchange.create_market_order(sym, side, qty)
                     
-                    if signal == "LONG":
-                        tp_price = price * (1 + TAKE_PROFIT)
-                        sl_price = price * (1 - STOP_LOSS)
-                        icon = "🟢 **LONG OPENED**"
-                    else:
-                        tp_price = price * (1 - TAKE_PROFIT)
-                        sl_price = price * (1 + STOP_LOSS)
-                        icon = "🔴 **SHORT OPENED**"
-                        
-                    msg = f"{icon}\n🪙 Coin: {sym}\n💵 Entry: {price:.4f} $\n🎯 TP: {tp_price:.4f} $\n🛑 SL: {sl_price:.4f} $"
-                    await context.bot.send_message(chat_id=active_chat_id, text=msg)
+                    # حسابات برمجية للرسائل
+                    pnl = (price - entry) * qty if pos_type == 'LONG' else (entry - price) * qty
+                    global wins, losses
+                    if pnl > 0: wins += 1
+                    else: losses += 1
+                    trade_history.append(pnl)
+                    positions_virtual.pop(sym)
+                    
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"{close_reason}\n🪙 {sym}\n💵 Price: {price:.4f} $\n📉 PnL: {pnl:.2f} $")
+                except Exception as e:
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Error closing {sym}: {e}")
 
-# ================= COMMANDS & BUTTONS =================
+        # فتح صفقات جديدة إذا لم يكن هناك صفقة مفتوحة للعملة
+        else:
+            if signal in ["LONG", "SHORT"] and real_usdt_balance > 10: # التأكد من وجود كاش كافي
+                trade_amount_usdt = real_usdt_balance * RISK_PER_TRADE
+                qty = trade_amount_usdt / price
+                
+                try:
+                    # التنفيذ الحقيقي في السوق
+                    side = 'buy' if signal == 'LONG' else 'sell'
+                    order = exchange.create_market_order(sym, side, qty)
+                    
+                    # تسجيل الصفقة لتتبعها
+                    positions_virtual[sym] = {'qty': qty, 'entry': price, 'type': signal}
+                    
+                    icon = "🟢 **REAL LONG OPENED**" if signal == "LONG" else "🔴 **REAL SHORT OPENED**"
+                    msg = f"{icon}\n🪙 Coin: {sym}\n💵 Entry: {price:.4f} $\n💰 Size: {trade_amount_usdt:.2f} USDT"
+                    await context.bot.send_message(chat_id=active_chat_id, text=msg)
+                    
+                    # تحديث الرصيد بعد فتح الصفقة
+                    real_usdt_balance -= trade_amount_usdt 
+                    
+                except Exception as e:
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Order failed for {sym}\nReason: {e}")
+
+# ================= COMMANDS =================
 def get_main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 فحص السوق الآن", callback_data="scan")],
-        [InlineKeyboardButton("📊 Stats", callback_data="stats"), InlineKeyboardButton("💼 Positions", callback_data="positions")]
+        [InlineKeyboardButton("📡 رادار السوق", callback_data="scan"), InlineKeyboardButton("💰 رصيد المحفظة", callback_data="balance")],
+        [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="stats"), InlineKeyboardButton("💼 صفقات مفتوحة", callback_data="positions")]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "✅ **تم تحديث الوحش!**\nالبوت الآن يراقب 10 عملات على فريم (30m) ويفتح صفقات (LONG & SHORT).\n💰 الرصيد المبدئي: 130 USDT",
+        "🚨 **تم تفعيل الوحش على الحساب الحقيقي (BingX)!** 🚨\nالبوت الآن يقرأ رصيدك الفعلي وجاهز للتداول بالدولار الحقيقي.",
         reply_markup=get_main_keyboard()
     )
 
@@ -217,63 +223,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sym in SYMBOLS:
             price, signal, sar_val, ema50 = get_signal(sym)
             if price:
-                if signal == "LONG": status = "🟢 فرصة صعود (LONG)"
-                elif signal == "SHORT": status = "🔴 فرصة هبوط (SHORT)"
+                if signal == "LONG": status = "🟢 صعود"
+                elif signal == "SHORT": status = "🔴 هبوط"
                 else: status = "⏳ انتظار"
-                msg += f"🪙 {sym} | 🤖 {status}\n"
-            else:
-                msg += f"⚠️ {sym}: جاري التحميل...\n"
-        
+                msg += f"🪙 {sym.split(':')[0]} | {status}\n"
+        await query.edit_message_text(msg, reply_markup=get_main_keyboard())
+
+    elif query.data == "balance":
+        try:
+            bal = exchange.fetch_balance()
+            total = bal['total'].get('USDT', 0)
+            free = bal['free'].get('USDT', 0)
+            used = bal['used'].get('USDT', 0)
+            msg = f"🏦 **رصيد BingX الحقيقي:**\n\n💰 الإجمالي: {total:.2f} $\n💵 الكاش المتاح: {free:.2f} $\n🔒 محجوز للصفقات: {used:.2f} $"
+        except Exception as e:
+            msg = f"❌ خطأ في جلب الرصيد: {e}"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
     elif query.data == "stats":
         total_trades = wins + losses
         pnl = sum(trade_history)
-        
-        locked_margin = sum([pos['qty'] * pos['entry'] for pos in positions.values()])
-        total_value = virtual_wallet['USDT'] + locked_margin + pnl
-        
-        msg = f"💰 **Total Value:** {total_value:.2f} USDT\n💵 **Free Cash:** {virtual_wallet['USDT']:.2f} USDT\n📊 Trades: {total_trades}\n✅ Wins: {wins} | ❌ Losses: {losses}\n💸 Net PnL: {pnl:.2f} $"
+        msg = f"📊 **إحصائيات الجلسة الحالية:**\n\n🔄 الصفقات المغلقة: {total_trades}\n✅ ربح: {wins} | ❌ خسارة: {losses}\n💸 صافي الربح: {pnl:.2f} $"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
     elif query.data == "positions":
-        if not positions:
+        if not positions_virtual:
             await query.edit_message_text("📭 لا توجد صفقات مفتوحة حالياً.", reply_markup=get_main_keyboard())
             return
         msg = "💼 **Active Positions:**\n\n"
-        for sym, pos in positions.items():
+        for sym, pos in positions_virtual.items():
             icon = "🟢" if pos['type'] == "LONG" else "🔴"
-            msg += f"{icon} {sym} [{pos['type']}]\n💵 Entry: {pos['entry']:.4f} $\n---\n"
+            msg += f"{icon} {sym.split(':')[0]} [{pos['type']}]\n💵 Entry: {pos['entry']:.4f} $\n---\n"
         await query.edit_message_text(msg, reply_markup=get_main_keyboard())
 
-# ================= DUMMY SERVER =================
+# ================= SERVER =================
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Hedge Fund Bot is running on 30m!")
+        self.wfile.write(b"REAL TRADING BOT IS RUNNING!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    server.serve_forever()
+    HTTPServer(('0.0.0.0', port), DummyHandler).serve_forever()
 
 # ================= MAIN =================
 def main():
-    if not TOKEN:
-        print("❌ TELEGRAM_TOKEN missing")
-        return
-
     threading.Thread(target=run_dummy_server, daemon=True).start()
-
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
-
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
-
-    print("🚀 BOT STARTED SUCCESSFULLY (LONG/SHORT - 10 COINS - 30m)...")
+    print("🚀 REAL TRADING BOT STARTED...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
