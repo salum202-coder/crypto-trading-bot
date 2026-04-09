@@ -23,17 +23,16 @@ SYMBOLS = [
 ]
 
 # ================= TRADING SETTINGS =================
-RISK_PER_TRADE = 0.15  # الدخول بـ 15% من الرصيد المتاح
-LEVERAGE = 10          # الرافعة المالية 10x (لحل مشكلة الحد الأدنى للكميات)
-STOP_LOSS = 0.015      # وقف الخسارة (يعادل 15% من مبلغ الدخول الفعلي)
-TAKE_PROFIT = 0.03     # أخذ الربح (يعادل 30% من مبلغ الدخول الفعلي)
+RISK_PER_TRADE = 0.15  
+LEVERAGE = 10          
+STOP_LOSS = 0.015      
+TAKE_PROFIT = 0.03     
 
 trade_history = []
 wins = 0
 losses = 0
 positions_virtual = {} 
 
-# الاتصال بمنصة BingX وتحميل قوانين الأسواق (عشان الكسور)
 try:
     exchange = ccxt.bingx({
         'apiKey': BINGX_API_KEY,
@@ -43,7 +42,7 @@ try:
             'defaultType': 'swap' 
         }
     })
-    exchange.load_markets() # تحميل قوانين المنصة (الحدود الدنيا والكسور)
+    exchange.load_markets() 
     print("✅ Successfully connected to BingX API and loaded markets")
 except Exception as e:
     print(f"❌ Failed to connect to BingX: {e}")
@@ -163,7 +162,11 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
             if close_signal:
                 try:
                     side = 'sell' if pos_type == 'LONG' else 'buy'
-                    exchange.create_market_order(sym, side, qty, params={'positionSide': pos_type})
+                    # التعديل هنا: إضافة reduceOnly لضمان الإغلاق بدون أخطاء
+                    exchange.create_market_order(sym, side, qty, params={
+                        'positionSide': pos_type,
+                        'reduceOnly': True
+                    })
                     
                     pnl = (price - entry) * qty if pos_type == 'LONG' else (entry - price) * qty
                     global wins, losses
@@ -174,30 +177,27 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                     
                     await context.bot.send_message(chat_id=active_chat_id, text=f"{close_reason}\n🪙 {sym.split(':')[0]}\n💵 Price: {price:.4f} $\n📉 PnL: {pnl:.2f} $")
                 except Exception as e:
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Error closing {sym}: {e}")
+                    await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Error closing {sym.split(':')[0]}: {e}")
 
         # ================= فتح صفقات جديدة =================
         else:
             if signal in ["LONG", "SHORT"] and real_usdt_balance > 10: 
-                trade_margin = real_usdt_balance * RISK_PER_TRADE # المبلغ اللي بيسحبه من محفظتك (حوالي 20$)
-                position_size_usdt = trade_margin * LEVERAGE      # حجم الصفقة بعد الرافعة 10x (حوالي 200$)
-                raw_qty = position_size_usdt / price              # الكمية قبل الفلترة
+                trade_margin = real_usdt_balance * RISK_PER_TRADE 
+                position_size_usdt = trade_margin * LEVERAGE      
+                raw_qty = position_size_usdt / price              
                 
                 try:
-                    # فلترة الكمية لتتناسب مع قوانين BingX (الكسور الدقيقة)
                     qty_str = exchange.amount_to_precision(sym, raw_qty)
                     qty = float(qty_str)
                 except Exception:
-                    qty = round(raw_qty, 3) # خطة بديلة في حال فشل الفلتر
+                    qty = round(raw_qty, 3) 
                 
                 try:
-                    # محاولة ضبط الرافعة المالية برمجياً أولاً
                     try:
                         exchange.set_leverage(LEVERAGE, sym)
                     except:
-                        pass # بعض المنصات تضبطها تلقائياً ولا تحتاج أمر
+                        pass 
                     
-                    # إرسال الأمر المفلتر للسوق
                     side = 'buy' if signal == 'LONG' else 'sell'
                     order = exchange.create_market_order(sym, side, qty, params={'positionSide': signal})
                     
@@ -222,7 +222,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "🚨 **تم تفعيل فلتر الكميات والرافعة المالية (10x)!** 🚨\nالبوت الآن قادر على فتح صفقات للعملات الكبيرة (مثل BTC و ETH).",
+        "🚨 **تم تحديث بروتوكول الإغلاق (ReduceOnly)!** 🚨\nالبوت الآن يغلق صفقاته بسلاسة تامة بإذن الله.",
         reply_markup=get_main_keyboard()
     )
 
@@ -273,7 +273,7 @@ class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"REAL TRADING BOT IS RUNNING (PRECISION FIXED)!")
+        self.wfile.write(b"REAL TRADING BOT IS RUNNING (REDUCE ONLY FIXED)!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
