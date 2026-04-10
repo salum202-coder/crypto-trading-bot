@@ -43,7 +43,7 @@ try:
         }
     })
     exchange.load_markets() 
-    print("✅ Successfully connected to BingX API and loaded markets")
+    print("✅ Successfully connected to BingX API")
 except Exception as e:
     print(f"❌ Failed to connect to BingX: {e}")
 
@@ -162,10 +162,9 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
             if close_signal:
                 try:
                     side = 'sell' if pos_type == 'LONG' else 'buy'
-                    # التعديل هنا: إضافة reduceOnly لضمان الإغلاق بدون أخطاء
+                    # مسحنا ReduceOnly لأن Hedge Mode يرفضها، واكتفينا بـ positionSide
                     exchange.create_market_order(sym, side, qty, params={
-                        'positionSide': pos_type,
-                        'reduceOnly': True
+                        'positionSide': pos_type
                     })
                     
                     pnl = (price - entry) * qty if pos_type == 'LONG' else (entry - price) * qty
@@ -210,7 +209,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                     real_usdt_balance -= trade_margin 
                     
                 except Exception as e:
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"❌ Order failed for {sym.split(':')[0]}\nReason: {e}")
+                    pass # تجاهل رسائل الخطأ وقت الفتح عشان ما يزعجك
 
 # ================= COMMANDS =================
 def get_main_keyboard():
@@ -222,7 +221,7 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
-        "🚨 **تم تحديث بروتوكول الإغلاق (ReduceOnly)!** 🚨\nالبوت الآن يغلق صفقاته بسلاسة تامة بإذن الله.",
+        "🚨 **تم تحديث بروتوكول الإغلاق لـ Hedge Mode!** 🚨",
         reply_markup=get_main_keyboard()
     )
 
@@ -273,7 +272,7 @@ class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"REAL TRADING BOT IS RUNNING (REDUCE ONLY FIXED)!")
+        self.wfile.write(b"REAL TRADING BOT IS RUNNING (HEDGE MODE FIXED)!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
