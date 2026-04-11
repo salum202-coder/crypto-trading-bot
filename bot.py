@@ -1,3 +1,14 @@
+import subprocess
+import sys
+
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# تثبيت المكتبات الناقصة إجبارياً عند بدء التشغيل
+try:
+    import pandas_ta
+except ImportError:
+    install('pandas_ta')
 import pandas_ta as ta
 import pandas as pd
 import time
