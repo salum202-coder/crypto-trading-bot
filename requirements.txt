@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==20.7
 ccxt
 pandas
+pandas_ta
