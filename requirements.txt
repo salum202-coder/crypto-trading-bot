@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==20.7
 ccxt
 pandas
 requests
+pandas_ta@git+https://github.com/twopirllc/pandas-ta.git@development
