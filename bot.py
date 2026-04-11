@@ -1,94 +1,122 @@
 import os
-import sys
-import subprocess
 import time
-import requests
-import pandas as pd
 import hmac
 import hashlib
+import requests
+import pandas as pd
+import sys
+import subprocess
 
 # --- 1. حل مشكلة المكتبات في Render للأبد ---
 def install_requirements():
     try:
         import pandas_ta
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas_ta"])
+        print("Installing pandas_ta from GitHub...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "https://github.com/twopirllc/pandas-ta/archive/master.zip"])
 
 install_requirements()
 import pandas_ta as ta
 
-# --- 2. إعدادات المفاتيح (ضع بياناتك هنا) ---
-API_KEY = "YOUR_BINGX_API_KEY"
-SECRET_KEY = "YOUR_BINGX_SECRET_KEY"
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+# --- 2. سحب المفاتيح من إعدادات Render (Environment Variables) ---
+API_KEY = os.getenv('API_KEY')
+SECRET_KEY = os.getenv('SECRET_KEY')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 
 # --- 3. إعدادات القناص المطور (نصائح الخبير) ---
+SYMBOL_LIST = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'LINK/USDT']
 LEVERAGE = 10
-POSITION_SIZE = 0.15        # الدخول بـ 15% من الكاش
+POSITION_SIZE_PCT = 0.15    # الدخول بـ 15% من الكاش
 TAKE_PROFIT = 0.015         # هدف الربح 1.5% (15% ROE)
-STOP_LOSS = 0.03            # حزام الأمان 3% (30% ROE) - نصيحة الخبير
-ADX_THRESHOLD = 25          # فلتر السيولة
-SAR_STEP = 0.015            # حساسية SAR موزونة (أقل تذبذب)
+STOP_LOSS = 0.03            # حزام الأمان 3% (30% ROE)
+ADX_THRESHOLD = 25          # فلتر قوة الترند
+SAR_STEP = 0.015            # حساسية SAR موزونة
 SAR_MAX = 0.2
-COOLDOWN_PERIOD = 3600      # كولداون ساعة للعملة الخاسرة
-EMA_PERIOD = 200            # تحديد الاتجاه العام
+EMA_PERIOD = 200            # فلتر الاتجاه العام
+COOLDOWN_TIME = 3600        # كولداون ساعة بعد الخسارة
 
-# سجل لمتابعة الكولداون
-loss_tracker = {}
+cooldown_tracker = {}
 
-# --- 4. وظائف المساعدة والربط ---
-def send_telegram_message(message):
+# --- 4. وظائف الاتصال والتحكم ---
+def send_telegram_msg(text):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload)
-    except Exception as e: print(f"Telegram Error: {e}")
+    try: requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    except: pass
 
-# --- 5. منطق التحليل الفني (الدماغ) ---
-def get_signal(symbol, df):
-    # حساب المؤشرات
+def get_bingx_candles(symbol):
+    # كود جلب الشموع من BingX باستخدام API
+    # يتم استبداله بكود جلب البيانات الفعلي من مشروعك
+    pass
+
+# --- 5. منطق التحليل واتخاذ القرار ---
+def trading_logic(symbol, df):
+    global cooldown_tracker
+    
+    # حساب المؤشرات الفنية
     df.ta.adx(append=True)
     df.ta.ema(length=EMA_PERIOD, append=True)
     df.ta.psar(step=SAR_STEP, max_step=SAR_MAX, append=True)
     
-    last_row = df.iloc[-1]
+    last = df.iloc[-1]
+    current_price = last['close']
     
-    # فلتر الكولداون
-    if symbol in loss_tracker and (time.time() - loss_tracker[symbol] < COOLDOWN_PERIOD):
-        return "WAIT_COOLDOWN"
-
-    # فلتر الشمعة الانتحارية (نصيحة الخبير)
-    candle_body = abs(last_row['close'] - last_row['open']) / last_row['open']
-    if candle_body > 0.02: return "WAIT_VOLATILE"
-
-    # فلتر السيولة
-    if last_row['ADX_14'] < ADX_THRESHOLD: return "WAIT_LOW_VOL"
-
-    # استخراج قيم SAR
-    sar_long = last_row['PSARl_0.015_0.2']
-    is_bullish = pd.notna(sar_long)
-
-    # شروط الدخول
-    if last_row['close'] > last_row[f'EMA_{EMA_PERIOD}'] and is_bullish:
-        return "LONG"
-    elif last_row['close'] < last_row[f'EMA_{EMA_PERIOD}'] and not is_bullish:
-        return "SHORT"
+    # فلترة الصفقات (نصائح الخبير)
+    if symbol in cooldown_tracker and (time.time() - cooldown_tracker[symbol] < COOLDOWN_TIME):
+        return
     
-    return "WAIT"
+    candle_size = abs(last['close'] - last['open']) / last['open']
+    if candle_size > 0.02 or last['ADX_14'] < ADX_THRESHOLD:
+        return
 
-# --- 6. الوظيفة الأساسية لتشغيل البوت ---
-def run_bot():
-    print("🚀 SMART SNIPER BOT IS STARTING...")
-    send_telegram_message("🤖 *تم تشغيل البوت المطور بنجاح!* \nالإعدادات: هدف 15% | وقف 30% | درع SAR مفعل.")
+    # تحديد حالة SAR والـ EMA
+    ema_val = last[f'EMA_{EMA_PERIOD}']
+    sar_bullish = pd.notna(last['PSARl_0.015_0.2']) # نقطة SAR تحت السعر
+
+    # إشارات الدخول
+    if current_price > ema_val and sar_bullish:
+        print(f"🚀 إشارة LONG على {symbol}")
+        # تنفيذ أمر شراء (Execute Buy Order)
+    elif current_price < ema_val and not sar_bullish:
+        print(f"🔻 إشارة SHORT على {symbol}")
+        # تنفيذ أمر بيع (Execute Sell Order)
+
+# --- 6. نظام إدارة الصفقات المفتوحة (الخروج الذكي) ---
+def manage_positions(open_positions):
+    for pos in open_positions:
+        symbol = pos['symbol']
+        entry = float(pos['entryPrice'])
+        mark = float(pos['markPrice'])
+        side = pos['side']
+        
+        # حساب الربح اللحظي (ROE)
+        pnl = ((mark - entry) / entry) * 100 * (1 if side == "LONG" else -1)
+        
+        # 1. الخروج بالهدف (15% ربح)
+        if pnl >= (TAKE_PROFIT * 100):
+            print(f"✅ تم تحقيق الهدف لـ {symbol}")
+            # أمر إغلاق الصفقة
+            
+        # 2. الخروج بوقف الخسارة (30% خسارة)
+        elif pnl <= -(STOP_LOSS * 100):
+            cooldown_tracker[symbol] = time.time()
+            print(f"🛑 ضرب وقف الخسارة لـ {symbol}")
+            # أمر إغلاق الصفقة
+
+# --- 7. الحلقة الرئيسية (The Master Loop) ---
+if __name__ == "__main__":
+    welcome_msg = "🚀 *تم تشغيل القناص المطور V2*\n"
+    welcome_msg += "🛡️ النظام: إدارة مخاطر متقدمة\n"
+    welcome_msg += "📊 الأهداف: 15% ربح | 30% وقف خسارة"
+    send_telegram_msg(welcome_msg)
     
     while True:
         try:
-            # هنا يوضع كود جلب الأسعار من BingX وتنفيذ الأوامر
-            # (يتم تكرار العملية كل دقيقة)
+            # تنفيذ المهام:
+            # 1. فحص الصفقات المفتوحة
+            # 2. البحث عن فرص جديدة
             time.sleep(60)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"System Error: {e}")
             time.sleep(30)
-
-if __name__ == "__main__":
-    run_bot()
