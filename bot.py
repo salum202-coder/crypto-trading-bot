@@ -1,301 +1,105 @@
-import os
-import ccxt
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler
-)
+import pandas_ta as ta
+import pandas as pd
+import time
 
-# ================= CONFIG & API =================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BINGX_API_KEY = os.getenv("BINGX_API_KEY")
-BINGX_SECRET = os.getenv("BINGX_SECRET")
+# ==========================================
+# ⚙️ 1. الإعدادات المحدثة (إدارة المخاطر الجديدة)
+# ==========================================
+LEVERAGE = 10
+POSITION_SIZE = 0.15
+TAKE_PROFIT = 0.015         # هدف الربح (15% ROE)
+STOP_LOSS = 0.03            # حزام الأمان (30% ROE) - نصيحة الخبير
+ADX_THRESHOLD = 25
+EMA_PERIOD = 200
 
-# القائمة المحدثة (تم إضافة ZEC)
-SYMBOLS = [
-    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT', 
-    'XRP/USDT:USDT', 'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'DOGE/USDT:USDT', 
-    'LINK/USDT:USDT', 'DOT/USDT:USDT', 'ZEC/USDT:USDT'
-]
+# إعدادات SAR الجديدة (أقل حساسية للتذبذب)
+SAR_STEP = 0.015            # قللناها من 0.02 لتكون أبعد عن السعر قليلاً
+SAR_MAX = 0.2
 
-# ================= TRADING SETTINGS =================
-RISK_PER_TRADE = 0.15  
-LEVERAGE = 10          
-STOP_LOSS = 0.015      
-TAKE_PROFIT = 0.015     
-ADX_THRESHOLD = 25     # لا يدخل أي صفقة إلا إذا كانت قوة الترند فوق 25
+# نظام الكولداون (تجنب الدخول المتكرر بعد الخسارة)
+COOLDOWN_PERIOD = 3600      # ساعة كاملة راحة للعملة الخاسرة
+loss_tracker = {}           # لتسجيل وقت آخر خسارة لكل عملة
 
-trade_history = []
-wins = 0
-losses = 0
-positions_virtual = {} 
-
-try:
-    exchange = ccxt.bingx({
-        'apiKey': BINGX_API_KEY,
-        'secret': BINGX_SECRET,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
-    })
-    exchange.load_markets() 
-    print("✅ Successfully connected to BingX API")
-except Exception as e:
-    print(f"❌ Failed to connect to BingX: {e}")
-
-# ================= INDICATORS =================
-def ema(data, period):
-    if len(data) < period: return data[-1]
-    k = 2 / (period + 1)
-    ema_val = data[0]
-    for price in data:
-        ema_val = price * k + ema_val * (1 - k)
-    return ema_val
-
-def calculate_adx(highs, lows, closes, period=14):
-    if len(closes) < period * 2: return 0
-    tr = []
-    up_move = []
-    down_move = []
-    for i in range(1, len(closes)):
-        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
-        dm_plus = highs[i] - highs[i-1] if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
-        dm_minus = lows[i-1] - lows[i] if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
-        up_move.append(max(dm_plus, 0))
-        down_move.append(max(dm_minus, 0))
+# ==========================================
+# 🧠 2. منطق تحليل السوق (مع فلتر الشمعة الكبيرة)
+# ==========================================
+def check_entry_signal(symbol, df):
+    # حساب المؤشرات
+    df.ta.adx(append=True)
+    df.ta.ema(length=EMA_PERIOD, append=True)
+    df.ta.psar(step=SAR_STEP, max_step=SAR_MAX, append=True)
     
-    atr = sum(tr[:period]) / period if period > 0 else 1 # حماية من القسمة على صفر
-    if atr == 0: atr = 0.0001
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
     
-    plus_di = 100 * (sum(up_move[:period]) / period) / atr
-    minus_di = 100 * (sum(down_move[:period]) / period) / atr
+    current_price = last_row['close']
+    adx_value = last_row['ADX_14']
+    ema_value = last_row[f'EMA_{EMA_PERIOD}']
     
-    if (plus_di + minus_di) == 0: return 0
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    return dx
+    # تحديد قيمة SAR الحالية (سواء كانت صاعدة أو هابطة)
+    sar_long = last_row['PSARl_0.015_0.2']
+    sar_short = last_row['PSARs_0.015_0.2']
+    is_sar_bullish = pd.notna(sar_long)
 
-def calculate_sar(highs, lows, af=0.02, max_af=0.2):
-    if len(highs) < 2: return lows[-1]
-    sar = [0.0] * len(highs)
-    is_long = True
-    ep = highs[0]
-    cur_af = af
-    sar[0] = lows[0] - (highs[0] - lows[0])
-    for i in range(1, len(highs)):
-        sar[i] = sar[i-1] + cur_af * (ep - sar[i-1])
-        if is_long:
-            if lows[i] < sar[i]:
-                is_long = False
-                sar[i] = ep
-                ep = lows[i]
-                cur_af = af
-            else:
-                if highs[i] > ep:
-                    ep = highs[i]
-                    cur_af = min(cur_af + af, max_af)
-                sar[i] = min(sar[i], lows[i-1])
-                if i > 1: sar[i] = min(sar[i], lows[i-2])
-        else:
-            if highs[i] > sar[i]:
-                is_long = True
-                sar[i] = ep
-                ep = highs[i]
-                cur_af = af
-            else:
-                if lows[i] < ep:
-                    ep = lows[i]
-                    cur_af = min(cur_af + af, max_af)
-                sar[i] = max(sar[i], highs[i-1])
-                if i > 1: sar[i] = max(sar[i], highs[i-2])
-    return sar[-1]
+    # --- فلتر الكولداون ---
+    if symbol in loss_tracker:
+        if time.time() - loss_tracker[symbol] < COOLDOWN_PERIOD:
+            return "COOLDOWN"
 
-# ================= STRATEGY =================
-def get_signal(symbol):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe='30m', limit=100)
-        bars = bars[:-1] 
-        closes = [b[4] for b in bars]
-        highs = [b[2] for b in bars]
-        lows = [b[3] for b in bars]
+    # --- فلتر الشمعة الانتحارية (نصيحة الخبير) ---
+    candle_body_pct = abs(last_row['close'] - last_row['open']) / last_row['open']
+    if candle_body_pct > 0.02: # إذا الشمعة الوحدة تحركت أكثر من 2% لا تدخل
+        return "CANDLE_TOO_BIG"
+
+    # --- فلتر السيولة (ADX) ---
+    if adx_value < ADX_THRESHOLD:
+        return "LOW_VOLATILITY"
+
+    # --- منطق الدخول (تطابق الشروط) ---
+    if current_price > ema_value and is_sar_bullish:
+        return "LONG"
+    elif current_price < ema_value and not is_sar_bullish:
+        return "SHORT"
         
-        price = closes[-1]
-        ema50 = ema(closes, 50)
-        ema20 = ema(closes, 20) 
-        sar_val = calculate_sar(highs, lows)
-        adx_val = calculate_adx(highs, lows, closes)
+    return "WAIT"
 
-        # فلترة ذكية: الدخول فقط إذا كان هناك ترند واضح (ADX > 25)
-        if adx_val > ADX_THRESHOLD:
-            if price > ema50 and ema20 > ema50 and sar_val < price:
-                return price, "LONG", adx_val, sar_val
-            if price < ema50 and ema20 < ema50 and sar_val > price:
-                return price, "SHORT", adx_val, sar_val
-
-        return price, "HOLD", adx_val, sar_val
-    except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
-        return None, "HOLD", 0, 0
-
-# ================= COMMANDS KEYBOARD =================
-def get_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 رادار السوق", callback_data="scan"), InlineKeyboardButton("💰 رصيد المحفظة", callback_data="balance")],
-        [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="stats"), InlineKeyboardButton("💼 صفقات مفتوحة", callback_data="positions")]
-    ])
-
-# ================= JOB QUEUE =================
-async def trading_job(context: ContextTypes.DEFAULT_TYPE):
-    active_chat_id = context.bot_data.get("chat_id") or ENV_CHAT_ID
-    if not active_chat_id: return
+# ==========================================
+# 🛡️ 3. منطق الخروج (مع عرض النسبة والتحكم اليدوي)
+# ==========================================
+def check_exit_signal(position):
+    symbol = position['symbol']
+    side = position['side']
+    entry_price = float(position['entryPrice'])
+    current_price = float(position['markPrice'])
     
-    try:
-        balance = exchange.fetch_balance()
-        real_usdt_balance = balance['free'].get('USDT', 0)
-    except: return
-
-    for sym in SYMBOLS:
-        price, signal, adx_val, sar_val = get_signal(sym)
-        if not price: continue
-
-        # ================= الإغلاق الذكي =================
-        if sym in positions_virtual:
-            pos = positions_virtual[sym]
-            entry = pos['entry']
-            pos_type = pos['type']
-            qty = pos['qty']
-            
-            close_signal = False
-            close_reason = ""
-            
-            if pos_type == "LONG":
-                if price <= entry * (1 - STOP_LOSS): close_signal, close_reason = True, "🛑 SL HIT (LONG)"
-                elif price >= entry * (1 + TAKE_PROFIT): close_signal, close_reason = True, "🎯 TP HIT (LONG)"
-                elif sar_val > price: close_signal, close_reason = True, "⚠️ SAR REVERSED (LONG)"
-            elif pos_type == "SHORT":
-                if price >= entry * (1 + STOP_LOSS): close_signal, close_reason = True, "🛑 SL HIT (SHORT)"
-                elif price <= entry * (1 - TAKE_PROFIT): close_signal, close_reason = True, "🎯 TP HIT (SHORT)"
-                elif sar_val < price: close_signal, close_reason = True, "⚠️ SAR REVERSED (SHORT)"
-
-            if close_signal:
-                try:
-                    side = 'sell' if pos_type == 'LONG' else 'buy'
-                    exchange.create_market_order(sym, side, qty, params={'positionSide': pos_type})
-                    
-                    pnl = (price - entry) * qty if pos_type == 'LONG' else (entry - price) * qty
-                    global wins, losses
-                    if pnl > 0: wins += 1
-                    else: losses += 1
-                    trade_history.append(pnl)
-                    positions_virtual.pop(sym)
-                    
-                    await context.bot.send_message(chat_id=active_chat_id, text=f"{close_reason}\n✅ Closed: {sym.split(':')[0]}\n💵 Price: {price:.4f} $\n💰 PnL: {pnl:.2f} $")
-                except Exception as e:
-                    print(f"Error closing {sym}: {e}")
-
-        # ================= الفتح الذكي (بدون سقف + فلتر ADX) =================
-        else:
-            if signal in ["LONG", "SHORT"] and real_usdt_balance > 10:
-                trade_margin = real_usdt_balance * RISK_PER_TRADE
-                position_size_usdt = trade_margin * LEVERAGE
-                raw_qty = position_size_usdt / price
-                
-                try:
-                    qty_str = exchange.amount_to_precision(sym, raw_qty)
-                    qty = float(qty_str)
-                except Exception:
-                    qty = round(raw_qty, 3)
-                    
-                try:
-                    try:
-                        exchange.set_leverage(LEVERAGE, sym)
-                    except: pass
-                    
-                    side = 'buy' if signal == 'LONG' else 'sell'
-                    exchange.create_market_order(sym, side, qty, params={'positionSide': signal})
-                    positions_virtual[sym] = {'qty': qty, 'entry': price, 'type': signal}
-                    
-                    icon = "🟢 **SMART LONG**" if signal == "LONG" else "🔴 **SMART SHORT**"
-                    msg = f"{icon}\n🪙 Coin: {sym.split(':')[0]}\n🔥 ADX Power: {adx_val:.1f}\n💵 Entry: {price:.4f} $\n💼 Margin: {trade_margin:.2f} $"
-                    await context.bot.send_message(chat_id=active_chat_id, text=msg)
-                    
-                    real_usdt_balance -= trade_margin 
-                except Exception as e:
-                    print(f"Error opening {sym}: {e}")
-
-# ================= BUTTON HANDLER =================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "scan":
-        msg = "📡 **رادار السوق الذكي (30m):**\n\n"
-        for sym in SYMBOLS:
-            price, signal, adx_val, sar_val = get_signal(sym)
-            if price:
-                if signal == "LONG": status = "🟢 صعود قوي"
-                elif signal == "SHORT": status = "🔴 هبوط قوي"
-                else: status = "⏳ انتظار/تذبذب"
-                msg += f"🪙 {sym.split(':')[0]} | ADX: {adx_val:.1f} | {status}\n"
-        await query.edit_message_text(msg, reply_markup=get_main_keyboard())
-
-    elif query.data == "balance":
-        try:
-            bal = exchange.fetch_balance()
-            total = bal['total'].get('USDT', 0)
-            free = bal['free'].get('USDT', 0)
-            used = bal['used'].get('USDT', 0)
-            msg = f"🏦 **رصيد المحفظة:**\n\n💰 الإجمالي: {total:.2f} $\n💵 كاش متاح: {free:.2f} $\n🔒 محجوز: {used:.2f} $"
-        except Exception as e:
-            msg = f"❌ خطأ: {e}"
-        await query.edit_message_text(msg, reply_markup=get_main_keyboard())
-
-    elif query.data == "stats":
-        total_trades = wins + losses
-        pnl = sum(trade_history)
-        msg = f"📊 **إحصائيات الذكاء الاصطناعي:**\n\n🔄 صفقات: {total_trades}\n✅ ربح: {wins} | ❌ خسارة: {losses}\n💸 صافي الربح: {pnl:.2f} $"
-        await query.edit_message_text(msg, reply_markup=get_main_keyboard())
-
-    elif query.data == "positions":
-        if not positions_virtual:
-            await query.edit_message_text("📭 لا توجد صفقات مفتوحة حالياً.", reply_markup=get_main_keyboard())
-            return
-        msg = "💼 **الصفقات المفتوحة (الذكية):**\n\n"
-        for sym, pos in positions_virtual.items():
-            icon = "🟢" if pos['type'] == "LONG" else "🔴"
-            msg += f"{icon} {sym.split(':')[0]} [{pos['type']}]\n💵 الدخول: {pos['entry']:.4f} $\n---\n"
-        await query.edit_message_text(msg, reply_markup=get_main_keyboard())
-
-# ================= SERVER & MAIN =================
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"SMART AI BOT (ZEC ADDED) IS RUNNING!")
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(('0.0.0.0', port), DummyHandler).serve_forever()
-
-def main():
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
+    # حساب النسبة المئوية الحالية (التي ستظهر لك في التيليجرام)
+    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    if side == "SHORT":
+        pnl_pct = -pnl_pct
     
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.bot_data["chat_id"] = update.effective_chat.id
-        await update.message.reply_text(
-            "🚀 **تم تفعيل الوحش القناص الذكي!**\n\n(فلتر ADX يعمل | 11 عملة منها ZEC | بدون سقف صفقات)",
-            reply_markup=get_main_keyboard()
-        )
-        
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.job_queue.run_repeating(trading_job, interval=60, first=5)
-    print("🚀 SMART SNIPER BOT STARTED...")
-    app.run_polling(drop_pending_updates=True)
+    # 1. ضرب الهدف (Take Profit)
+    if (side == "LONG" and current_price >= entry_price * (1 + TAKE_PROFIT)) or \
+       (side == "SHORT" and current_price <= entry_price * (1 - TAKE_PROFIT)):
+        return "TP_HIT", pnl_pct
 
-if __name__ == "__main__":
-    main()
+    # 2. حزام الأمان (Hard Stop Loss)
+    if (side == "LONG" and current_price <= entry_price * (1 - STOP_LOSS)) or \
+       (side == "SHORT" and current_price >= entry_price * (1 + STOP_LOSS)):
+        loss_tracker[symbol] = time.time() # تفعيل الكولداون
+        return "STOP_LOSS_HIT", pnl_pct
+
+    # 3. خروج SAR الذكي (انعكاس النقاط الزرقاء)
+    # ملاحظة: يتم جلب الـ SAR المحدث من البيانات اللحظية
+    if side == "LONG" and is_sar_reversed_to_short:
+        return "SAR_EXIT", pnl_pct
+    if side == "SHORT" and is_sar_reversed_to_long:
+        return "SAR_EXIT", pnl_pct
+
+    return "HOLD", pnl_pct
+
+# ==========================================
+# 🎮 4. واجهة التحكم في التيليجرام (أزرار التحكم)
+# ==========================================
+# (هذا الجزء يوضح لك شكل الأزرار التي ستظهر في رسالتك القادمة)
+# [ إغلاق جميع الصفقات 🔴 ]
+# [ إغلاق الرابحة فقط 🟢 ]  [ إغلاق الخاسرة فقط 🟡 ]
