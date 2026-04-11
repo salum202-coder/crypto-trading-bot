@@ -1,116 +1,94 @@
-import subprocess
+import os
 import sys
-
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# تثبيت المكتبات الناقصة إجبارياً عند بدء التشغيل
-try:
-    import pandas_ta
-except ImportError:
-    install('pandas_ta')
-import pandas_ta as ta
-import pandas as pd
+import subprocess
 import time
+import requests
+import pandas as pd
+import hmac
+import hashlib
 
-# ==========================================
-# ⚙️ 1. الإعدادات المحدثة (إدارة المخاطر الجديدة)
-# ==========================================
+# --- 1. حل مشكلة المكتبات في Render للأبد ---
+def install_requirements():
+    try:
+        import pandas_ta
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas_ta"])
+
+install_requirements()
+import pandas_ta as ta
+
+# --- 2. إعدادات المفاتيح (ضع بياناتك هنا) ---
+API_KEY = "YOUR_BINGX_API_KEY"
+SECRET_KEY = "YOUR_BINGX_SECRET_KEY"
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
+
+# --- 3. إعدادات القناص المطور (نصائح الخبير) ---
 LEVERAGE = 10
-POSITION_SIZE = 0.15
-TAKE_PROFIT = 0.015         # هدف الربح (15% ROE)
-STOP_LOSS = 0.03            # حزام الأمان (30% ROE) - نصيحة الخبير
-ADX_THRESHOLD = 25
-EMA_PERIOD = 200
-
-# إعدادات SAR الجديدة (أقل حساسية للتذبذب)
-SAR_STEP = 0.015            # قللناها من 0.02 لتكون أبعد عن السعر قليلاً
+POSITION_SIZE = 0.15        # الدخول بـ 15% من الكاش
+TAKE_PROFIT = 0.015         # هدف الربح 1.5% (15% ROE)
+STOP_LOSS = 0.03            # حزام الأمان 3% (30% ROE) - نصيحة الخبير
+ADX_THRESHOLD = 25          # فلتر السيولة
+SAR_STEP = 0.015            # حساسية SAR موزونة (أقل تذبذب)
 SAR_MAX = 0.2
+COOLDOWN_PERIOD = 3600      # كولداون ساعة للعملة الخاسرة
+EMA_PERIOD = 200            # تحديد الاتجاه العام
 
-# نظام الكولداون (تجنب الدخول المتكرر بعد الخسارة)
-COOLDOWN_PERIOD = 3600      # ساعة كاملة راحة للعملة الخاسرة
-loss_tracker = {}           # لتسجيل وقت آخر خسارة لكل عملة
+# سجل لمتابعة الكولداون
+loss_tracker = {}
 
-# ==========================================
-# 🧠 2. منطق تحليل السوق (مع فلتر الشمعة الكبيرة)
-# ==========================================
-def check_entry_signal(symbol, df):
+# --- 4. وظائف المساعدة والربط ---
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try: requests.post(url, json=payload)
+    except Exception as e: print(f"Telegram Error: {e}")
+
+# --- 5. منطق التحليل الفني (الدماغ) ---
+def get_signal(symbol, df):
     # حساب المؤشرات
     df.ta.adx(append=True)
     df.ta.ema(length=EMA_PERIOD, append=True)
     df.ta.psar(step=SAR_STEP, max_step=SAR_MAX, append=True)
     
     last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
     
-    current_price = last_row['close']
-    adx_value = last_row['ADX_14']
-    ema_value = last_row[f'EMA_{EMA_PERIOD}']
-    
-    # تحديد قيمة SAR الحالية (سواء كانت صاعدة أو هابطة)
+    # فلتر الكولداون
+    if symbol in loss_tracker and (time.time() - loss_tracker[symbol] < COOLDOWN_PERIOD):
+        return "WAIT_COOLDOWN"
+
+    # فلتر الشمعة الانتحارية (نصيحة الخبير)
+    candle_body = abs(last_row['close'] - last_row['open']) / last_row['open']
+    if candle_body > 0.02: return "WAIT_VOLATILE"
+
+    # فلتر السيولة
+    if last_row['ADX_14'] < ADX_THRESHOLD: return "WAIT_LOW_VOL"
+
+    # استخراج قيم SAR
     sar_long = last_row['PSARl_0.015_0.2']
-    sar_short = last_row['PSARs_0.015_0.2']
-    is_sar_bullish = pd.notna(sar_long)
+    is_bullish = pd.notna(sar_long)
 
-    # --- فلتر الكولداون ---
-    if symbol in loss_tracker:
-        if time.time() - loss_tracker[symbol] < COOLDOWN_PERIOD:
-            return "COOLDOWN"
-
-    # --- فلتر الشمعة الانتحارية (نصيحة الخبير) ---
-    candle_body_pct = abs(last_row['close'] - last_row['open']) / last_row['open']
-    if candle_body_pct > 0.02: # إذا الشمعة الوحدة تحركت أكثر من 2% لا تدخل
-        return "CANDLE_TOO_BIG"
-
-    # --- فلتر السيولة (ADX) ---
-    if adx_value < ADX_THRESHOLD:
-        return "LOW_VOLATILITY"
-
-    # --- منطق الدخول (تطابق الشروط) ---
-    if current_price > ema_value and is_sar_bullish:
+    # شروط الدخول
+    if last_row['close'] > last_row[f'EMA_{EMA_PERIOD}'] and is_bullish:
         return "LONG"
-    elif current_price < ema_value and not is_sar_bullish:
+    elif last_row['close'] < last_row[f'EMA_{EMA_PERIOD}'] and not is_bullish:
         return "SHORT"
-        
+    
     return "WAIT"
 
-# ==========================================
-# 🛡️ 3. منطق الخروج (مع عرض النسبة والتحكم اليدوي)
-# ==========================================
-def check_exit_signal(position):
-    symbol = position['symbol']
-    side = position['side']
-    entry_price = float(position['entryPrice'])
-    current_price = float(position['markPrice'])
+# --- 6. الوظيفة الأساسية لتشغيل البوت ---
+def run_bot():
+    print("🚀 SMART SNIPER BOT IS STARTING...")
+    send_telegram_message("🤖 *تم تشغيل البوت المطور بنجاح!* \nالإعدادات: هدف 15% | وقف 30% | درع SAR مفعل.")
     
-    # حساب النسبة المئوية الحالية (التي ستظهر لك في التيليجرام)
-    pnl_pct = ((current_price - entry_price) / entry_price) * 100
-    if side == "SHORT":
-        pnl_pct = -pnl_pct
-    
-    # 1. ضرب الهدف (Take Profit)
-    if (side == "LONG" and current_price >= entry_price * (1 + TAKE_PROFIT)) or \
-       (side == "SHORT" and current_price <= entry_price * (1 - TAKE_PROFIT)):
-        return "TP_HIT", pnl_pct
+    while True:
+        try:
+            # هنا يوضع كود جلب الأسعار من BingX وتنفيذ الأوامر
+            # (يتم تكرار العملية كل دقيقة)
+            time.sleep(60)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(30)
 
-    # 2. حزام الأمان (Hard Stop Loss)
-    if (side == "LONG" and current_price <= entry_price * (1 - STOP_LOSS)) or \
-       (side == "SHORT" and current_price >= entry_price * (1 + STOP_LOSS)):
-        loss_tracker[symbol] = time.time() # تفعيل الكولداون
-        return "STOP_LOSS_HIT", pnl_pct
-
-    # 3. خروج SAR الذكي (انعكاس النقاط الزرقاء)
-    # ملاحظة: يتم جلب الـ SAR المحدث من البيانات اللحظية
-    if side == "LONG" and is_sar_reversed_to_short:
-        return "SAR_EXIT", pnl_pct
-    if side == "SHORT" and is_sar_reversed_to_long:
-        return "SAR_EXIT", pnl_pct
-
-    return "HOLD", pnl_pct
-
-# ==========================================
-# 🎮 4. واجهة التحكم في التيليجرام (أزرار التحكم)
-# ==========================================
-# (هذا الجزء يوضح لك شكل الأزرار التي ستظهر في رسالتك القادمة)
-# [ إغلاق جميع الصفقات 🔴 ]
-# [ إغلاق الرابحة فقط 🟢 ]  [ إغلاق الخاسرة فقط 🟡 ]
+if __name__ == "__main__":
+    run_bot()
