@@ -27,7 +27,7 @@ SYMBOLS = [
 RISK_PER_TRADE = 0.15  
 LEVERAGE = 10          
 STOP_LOSS = 0.015      
-TAKE_PROFIT = 0.03     
+TAKE_PROFIT = 0.015     
 ADX_THRESHOLD = 25     # لا يدخل أي صفقة إلا إذا كانت قوة الترند فوق 25
 
 trade_history = []
