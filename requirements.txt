@@ -2,4 +2,3 @@ python-telegram-bot[job-queue]==20.7
 ccxt
 pandas
 requests
-pandas-ta==0.3.14b0
