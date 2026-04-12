@@ -7,28 +7,24 @@ import ccxt
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= 🔑 1. CONFIG (المفاتيح) =================
+# ================= 🔑 1. CONFIG =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BINGX_API_KEY = os.getenv("BINGX_API_KEY")
 BINGX_SECRET = os.getenv("BINGX_SECRET")
 
-# قائمة العملات التي سيراقبها البوت
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT"]
 
-# ================= ⚙️ 2. SETTINGS (إعدادات الخبير) =================
-RISK_PER_TRADE = 0.01      # 1% مخاطرة من رأس المال (بناءً على نصيحة الخبير)
-LEVERAGE = 5               # الرافعة المالية
-TIMEFRAME = "15m"          # فريم 15 دقيقة (للحصول على صفقات أكثر)
+# ================= ⚙️ 2. PRO SETTINGS =================
+RISK_PER_TRADE = 0.01      
+LEVERAGE = 5               
+STOP_LOSS_PCT = 0.02       
+TAKE_PROFIT_PCT = 0.04     
+TIMEFRAME = "15m"
 
-# إعداد اللوغز (عشان نشوف كل صغيرة وكبيرة في Render)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("V6.2_Final")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("V7_Pro_Fortress")
 
-# إعداد المنصة
 exchange = ccxt.bingx({
     "apiKey": BINGX_API_KEY,
     "secret": BINGX_SECRET,
@@ -36,127 +32,127 @@ exchange = ccxt.bingx({
     "enableRateLimit": True
 })
 
-# ================= 📊 3. INDICATORS (المؤشرات) =================
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
+# ================= 📊 3. INDICATORS =================
+def calculate_indicators(closes):
+    # RSI
+    period = 14
     gains = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
     losses = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + (avg_gain/avg_loss))) if avg_loss != 0 else 100
+    
+    # Bollinger Bands
+    sma_20 = sum(closes[-20:]) / 20
+    std = (sum((x - sma_20) ** 2 for x in closes[-20:]) / 20) ** 0.5
+    upper, lower = sma_20 + (2 * std), sma_20 - (2 * std)
+    
+    # EMA 200 (Trend Confirmation)
+    ema_200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else sma_20
+    
+    return rsi, upper, lower, ema_200
 
-def calculate_bollinger(data, period=20, std_dev=2):
-    if len(data) < period: return None, None, None
-    sma = sum(data[-period:]) / period
-    std = (sum((x - sma) ** 2 for x in data[-period:]) / period) ** 0.5
-    return sma + (std_dev * std), sma, sma - (std_dev * std)
-
-# ================= 🧰 4. HELPERS (أدوات الحماية) =================
-def has_open_position(symbol):
-    """فحص لو فيه صفقة مفتوحة عشان ما نفتح ثانية على نفس العملة"""
+# ================= 🚪 4. EXIT STRATEGY (الإغلاق التلقائي) =================
+async def manage_exits(context: ContextTypes.DEFAULT_TYPE):
+    """وظيفة تراقب الصفقات وتغلقها عند الهدف أو الوقف"""
     try:
-        positions = exchange.fetch_positions([symbol])
-        for p in positions:
-            if float(p.get('contracts', 0)) != 0:
-                return True
-        return False
+        positions = exchange.fetch_positions()
+        for pos in positions:
+            contracts = float(pos.get('contracts', 0))
+            if contracts == 0: continue
+            
+            symbol = pos['symbol']
+            entry_price = float(pos['entryPrice'])
+            current_price = float(pos['markPrice'])
+            side = pos['side'] # long or short
+            
+            # حساب الربح/الخسارة بالنسبة المئوية
+            pnl_pct = (current_price - entry_price) / entry_price if side == 'long' else (entry_price - current_price) / entry_price
+            
+            should_close = False
+            reason = ""
+            
+            if pnl_pct >= TAKE_PROFIT_PCT:
+                should_close, reason = True, "✅ Take Profit Hit"
+            elif pnl_pct <= -STOP_LOSS_PCT:
+                should_close, reason = True, "❌ Stop Loss Hit"
+            
+            if should_close:
+                close_side = 'sell' if side == 'long' else 'buy'
+                exchange.create_market_order(symbol, close_side, contracts, params={'reduceOnly': True})
+                await context.bot.send_message(chat_id=ENV_CHAT_ID, text=f"🔔 **إغلاق صفقة:** {symbol}\nالسبب: {reason}\nالربح/الخسارة: {pnl_pct*100:.2f}%")
     except Exception as e:
-        logger.error(f"❌ خطأ في فحص الصفقات لـ {symbol}: {e}")
-        return True
+        logger.error(f"Error in Exit Manager: {e}")
 
-# ================= 🤖 5. TRADING LOGIC (قلب البوت) =================
+# ================= 🤖 5. TRADING LOGIC =================
 async def trading_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.bot_data.get("chat_id") or ENV_CHAT_ID
     if not chat_id: return
 
+    # أولاً: تشغيل مدير الإغلاق
+    await manage_exits(context)
+
     for sym in SYMBOLS:
         try:
-            # 1. جلب البيانات
-            bars = exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=50)
+            bars = exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=250)
             closes = [b[4] for b in bars]
             price = closes[-1]
             
-            # 2. فحص الصفقات الحالية
-            if has_open_position(sym):
-                continue
-
-            # 3. حساب المؤشرات (استراتيجية البولينجر)
-            upper, mid, lower = calculate_bollinger(closes)
-            rsi_val = calculate_rsi(closes)
+            rsi, upper, lower, ema_200 = calculate_indicators(closes)
             
-            # 4. شروط الدخول (V6 الصارمة)
+            # --- شروط الدخول المطورة (V7) ---
             signal = None
-            if price <= lower and rsi_val < 35:
+            # LONG: السعر عند الحد السفلي + RSI تشبع + السعر فوق EMA 200 (ترند صاعد)
+            if price <= lower and rsi < 35 and price > ema_200:
                 signal = "LONG"
-            elif price >= upper and rsi_val > 65:
+            # SHORT: السعر عند الحد العلوي + RSI تضخم + السعر تحت EMA 200 (ترند هابط)
+            elif price >= upper and rsi > 65 and price < ema_200:
                 signal = "SHORT"
             
             if signal:
-                # 5. إدارة رأس المال وحجم الصفقة
-                balance_data = exchange.fetch_balance()
-                balance = balance_data['USDT']['free']
+                # التأكد من عدم وجود صفقة مفتوحة
+                pos = exchange.fetch_positions([sym])
+                if any(float(p.get('contracts', 0)) != 0 for p in pos): continue
                 
-                if balance < 10: # حماية لو الرصيد قليل
-                    continue
-                
-                # معادلة حساب الكمية (الرصيد * المخاطرة * الرافعة) / السعر
+                balance = exchange.fetch_balance()['USDT']['free']
                 qty = (balance * RISK_PER_TRADE * LEVERAGE) / price
                 
-                # 6. تنفيذ الأوردر الحقيقي
-                exchange.set_leverage(LEVERAGE, sym)
-                side = 'buy' if signal == "LONG" else 'sell'
-                
-                # فتح الصفقة بماركت أوردر
-                order = exchange.create_market_order(sym, side, qty, params={'positionSide': signal})
-                
-                # إرسال التنبيه للتيليجرام
-                msg = (
-                    f"🚀 **دخول صفقة حقيقية (V6.2)**\n"
-                    f"🔹 العملة: {sym}\n"
-                    f"🔹 النوع: {signal}\n"
-                    f"🔹 السعر: {price}\n"
-                    f"🔹 الكمية: {qty:.4f}\n"
-                    f"📊 RSI: {rsi_val:.1f}"
-                )
-                await context.bot.send_message(chat_id=chat_id, text=msg)
-                logger.info(f"✅ تم تنفيذ صفقة {signal} على {sym}")
-
+                exchange.create_market_order(sym, 'buy' if signal == "LONG" else 'sell', qty, params={'positionSide': signal})
+                await context.bot.send_message(chat_id=chat_id, text=f"🚀 **دخول V7:** {sym} ({signal})\nالسعر: {price}\nتأكيد الترند: ✅")
         except Exception as e:
-            logger.error(f"❌ خطأ أثناء معالجة {sym}: {str(e)}")
+            logger.error(f"Error processing {sym}: {e}")
 
-# ================= 📱 6. TELEGRAM HANDLERS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الرد على أمر البداية وتخزين Chat ID"""
-    chat_id = update.effective_chat.id
-    context.bot_data["chat_id"] = chat_id
-    logger.info(f"✅ تم تفعيل البوت من Chat ID: {chat_id}")
-    await update.message.reply_text("🎯 **تم تفعيل القناص V6.2 بنجاح!**\nالاستراتيجية: Bollinger Bands + RSI\nالفريم: 15 دقيقة.")
+# ================= 📱 6. DASHBOARD COMMANDS =================
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        balance = exchange.fetch_balance()['USDT']['free']
+        pos = exchange.fetch_positions()
+        active_trades = [p['symbol'] for p in pos if float(p.get('contracts', 0)) != 0]
+        
+        msg = (
+            f"📊 **لوحة تحكم القناص V7**\n\n"
+            f"💰 الرصيد المتاح: {balance:.2f} USDT\n"
+            f"📦 الصفقات المفتوحة: {len(active_trades)}\n"
+            f"🔗 العملات النشطة: {', '.join(active_trades) if active_trades else 'لا يوجد'}"
+        )
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ في جلب البيانات: {e}")
 
 # ================= 🚀 7. RUNNING =================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"V6.2 PRO IS LIVE")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"PRO V7 IS LIVE")
 
 def main():
-    # سيرفر الصحة لمنع Render من إيقاف البوت
     port = int(os.environ.get("PORT", 8080))
     threading.Thread(target=lambda: HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever(), daemon=True).start()
     
-    # بناء تطبيق التيليجرام
     app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🎯 V7 Pro Fortress Activated!")))
+    app.add_handler(CommandHandler("status", status))
     
-    # إضافة الأوامر
-    app.add_handler(CommandHandler("start", start))
-    
-    # جدولة فحص السوق كل دقيقة
     app.job_queue.run_repeating(trading_job, interval=60, first=5)
-    
-    print("🚀 البوت بدأ العمل في وضع القنص الاحترافي...")
-    
-    # الحل السحري لمشكلة الـ Conflict: drop_pending_updates=True
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
