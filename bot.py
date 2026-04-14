@@ -524,7 +524,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
 
         state = trade_state.get(symbol)
         if not state:
-            # safety fallback
             trade_state[symbol] = {
                 "symbol": symbol,
                 "side": "LONG" if side == "long" else "SHORT",
@@ -545,9 +544,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
             continue
         atr_15m = snapshot["atr_15m"]
 
-        # LONG
         if side == "long":
-            # Stop loss
             if mark_price <= state["stop_loss"]:
                 if close_position(symbol, pos, 1.0):
                     await notify(
@@ -564,11 +561,10 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     set_cooldown(symbol)
                 continue
 
-            # TP1
             if not state["tp1_taken"] and mark_price >= state["tp1"]:
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
-                    state["stop_loss"] = state["entry"]  # breakeven
+                    state["stop_loss"] = state["entry"]
                     await notify(
                         context,
                         (
@@ -582,7 +578,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
 
             refreshed = get_symbol_position(symbol) or pos
 
-            # TP2
             if not state["tp2_taken"] and mark_price >= state["tp2"]:
                 if close_position(symbol, refreshed, 0.6):
                     state["tp2_taken"] = True
@@ -599,7 +594,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     )
                     continue
 
-            # Trailing
             if state["trailing_active"]:
                 new_trailing = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
                 if state["trailing_stop"] is None:
@@ -622,9 +616,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                         set_cooldown(symbol)
                     continue
 
-        # SHORT
         elif side == "short":
-            # Stop loss
             if mark_price >= state["stop_loss"]:
                 if close_position(symbol, pos, 1.0):
                     await notify(
@@ -641,7 +633,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     set_cooldown(symbol)
                 continue
 
-            # TP1
             if not state["tp1_taken"] and mark_price <= state["tp1"]:
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
@@ -659,7 +650,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
 
             refreshed = get_symbol_position(symbol) or pos
 
-            # TP2
             if not state["tp2_taken"] and mark_price <= state["tp2"]:
                 if close_position(symbol, refreshed, 0.6):
                     state["tp2_taken"] = True
@@ -676,7 +666,6 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     )
                     continue
 
-            # Trailing
             if state["trailing_active"]:
                 new_trailing = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
                 if state["trailing_stop"] is None:
@@ -817,6 +806,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start - dashboard\n"
+        "/help - commands list\n"
         "/status - bot status\n"
         "/balance - USDT balance\n"
         "/positions - open positions\n"
@@ -907,9 +897,10 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_paused
+
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
     if data == "dash_status":
@@ -955,7 +946,6 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"Done.\n\n{last_scan_summary}")
 
     elif data == "dash_pause":
-        global bot_paused
         bot_paused = True
         await query.message.reply_text("⏸ Bot paused.")
 
@@ -991,13 +981,11 @@ class HealthHandler(BaseHTTPRequestHandler):
 # 10) MAIN
 # =========================================================
 def main():
-    # Health server
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
         daemon=True,
     ).start()
 
-    # Fix for Python 3.14+ / environments without a current event loop
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -1011,7 +999,6 @@ def main():
     if ENV_CHAT_ID:
         app.bot_data["chat_id"] = str(ENV_CHAT_ID)
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -1024,7 +1011,6 @@ def main():
     app.add_handler(CommandHandler("closeall", cmd_close_all))
     app.add_handler(CallbackQueryHandler(dashboard_handler))
 
-    # Jobs
     app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
     app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
 
