@@ -34,7 +34,7 @@ ENTRY_TIMEFRAME = "15m"
 RISK_PER_TRADE = 0.0075      # 0.75%
 LEVERAGE = 3
 MAX_OPEN_POSITIONS = 1
-COOLDOWN_MINUTES = 60
+COOLDOWN_MINUTES = 45
 
 EMA_FAST = 20
 EMA_MED = 50
@@ -42,9 +42,9 @@ EMA_SLOW = 200
 ATR_PERIOD = 14
 VOL_MA_PERIOD = 20
 
-MIN_TREND_STRENGTH = 0.0025   # 0.25%
-MIN_VOLUME_FACTOR = 1.2
-MIN_RR_FOR_ENTRY = 1.5
+MIN_TREND_STRENGTH = 0.0015   # كان 0.0025
+MIN_VOLUME_FACTOR = 1.05      # كان 1.2
+MIN_RR_FOR_ENTRY = 1.2        # كان 1.5
 
 TP1_R = 1.0
 TP2_R = 2.0
@@ -75,8 +75,8 @@ exchange = ccxt.bingx({
 # =========================================================
 # 2) STATE
 # =========================================================
-cooldowns = {}  # symbol -> timestamp
-trade_state = {}  # symbol -> dict for TP1/TP2/trailing tracking
+cooldowns = {}
+trade_state = {}
 last_scan_summary = "No scans yet"
 
 # =========================================================
@@ -189,7 +189,7 @@ def explosive_candles(candles) -> bool:
         if o <= 0:
             continue
         body_pct = abs(cl - o) / o
-        if body_pct > 0.01:
+        if body_pct > 0.015:  # كان 0.01
             return True
     return False
 
@@ -222,6 +222,7 @@ def get_market_data(symbol: str):
 
         current = entry_bars[-1]
         prev = entry_bars[-2]
+        prev2 = entry_bars[-3]
         last3 = entry_bars[-3:]
 
         close_1h = trend_bars[-1][4]
@@ -247,25 +248,40 @@ def get_market_data(symbol: str):
             ((ema200_1h - ema50_1h) / ema200_1h) >= MIN_TREND_STRENGTH
         )
 
-        long_pullback = (low_15m <= ema20_15m or low_15m <= ema50_15m)
-        short_pullback = (high_15m >= ema20_15m or high_15m >= ema50_15m)
+        # pullback أخف: مو لازم يلمس EMA حرفيًا
+        long_pullback = (
+            low_15m <= ema20_15m * 1.003 or
+            low_15m <= ema50_15m * 1.002 or
+            close_15m <= ema20_15m * 1.002
+        )
 
-        pullback_too_deep_long = close_15m < ema50_15m and low_15m < prev_swing_low
-        pullback_too_deep_short = close_15m > ema50_15m and high_15m > prev_swing_high
+        short_pullback = (
+            high_15m >= ema20_15m * 0.997 or
+            high_15m >= ema50_15m * 0.998 or
+            close_15m >= ema20_15m * 0.998
+        )
 
+        # تخفيف شرط العمق
+        pullback_too_deep_long = close_15m < ema50_15m * 0.992 and low_15m < prev_swing_low
+        pullback_too_deep_short = close_15m > ema50_15m * 1.008 and high_15m > prev_swing_high
+
+        # confirmation أخف
         long_confirmation = (
-            (bullish_engulfing(prev, current) or close_15m > prev[2]) and
-            volume_15m > vol_ma_15m * MIN_VOLUME_FACTOR
+            bullish_engulfing(prev, current) or
+            close_15m > prev[2] or
+            (current[4] > current[1] and current[4] > prev[4] and volume_15m > vol_ma_15m * MIN_VOLUME_FACTOR)
         )
 
         short_confirmation = (
-            (bearish_engulfing(prev, current) or close_15m < prev[3]) and
-            volume_15m > vol_ma_15m * MIN_VOLUME_FACTOR
+            bearish_engulfing(prev, current) or
+            close_15m < prev[3] or
+            (current[4] < current[1] and current[4] < prev[4] and volume_15m > vol_ma_15m * MIN_VOLUME_FACTOR)
         )
 
+        # فلتر تذبذب أخف
         block_trade = any([
             explosive_candles(last3),
-            (atr_15m / close_15m) > 0.02,
+            (atr_15m / close_15m) > 0.028,  # كان 0.02
             volume_15m <= 0,
         ])
 
@@ -384,12 +400,12 @@ def calculate_trade_plan(symbol: str, market: dict, side: str, balance: float):
 
     if side == "LONG":
         swing_stop = min([b[3] for b in entry_bars[-3:]])
-        atr_stop = entry_price - atr_15m * 1.2
+        atr_stop = entry_price - atr_15m * 1.0
         stop_loss = min(swing_stop, atr_stop)
         risk_per_unit = entry_price - stop_loss
     else:
         swing_stop = max([b[2] for b in entry_bars[-3:]])
-        atr_stop = entry_price + atr_15m * 1.2
+        atr_stop = entry_price + atr_15m * 1.0
         stop_loss = max(swing_stop, atr_stop)
         risk_per_unit = stop_loss - entry_price
 
