@@ -75,6 +75,10 @@ TRAILING_ATR_MULTIPLIER = 1.2
 SCAN_INTERVAL_SECONDS = 60
 POSITION_CHECK_INTERVAL_SECONDS = 20
 
+# New strategy filters
+RECENT_FLIP_MAX_BARS = 3
+MAX_DISTANCE_FROM_EMA50 = 0.01  # 1%
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -304,6 +308,34 @@ def psar_flip_signal(ohlcv: List[List[float]]) -> Optional[str]:
     return None
 
 
+def psar_flip_bars_ago(ohlcv: List[List[float]]) -> Optional[int]:
+    psar = calc_psar(ohlcv)
+    if not psar or len(psar) < 4:
+        return None
+
+    bull_states = []
+    for i in range(len(ohlcv)):
+        close_i = ohlcv[i][4]
+        bull_states.append(psar[i] < close_i)
+
+    for i in range(len(bull_states) - 1, 0, -1):
+        if bull_states[i] != bull_states[i - 1]:
+            return (len(bull_states) - 1) - i
+    return None
+
+
+def is_recent_bull_flip(ohlcv: List[List[float]], max_bars: int) -> bool:
+    side = psar_side(ohlcv)
+    bars_ago = psar_flip_bars_ago(ohlcv)
+    return side == "BULL" and bars_ago is not None and bars_ago <= max_bars
+
+
+def is_recent_bear_flip(ohlcv: List[List[float]], max_bars: int) -> bool:
+    side = psar_side(ohlcv)
+    bars_ago = psar_flip_bars_ago(ohlcv)
+    return side == "BEAR" and bars_ago is not None and bars_ago <= max_bars
+
+
 # =========================================================
 # 4) EXCHANGE WRAPPERS
 # =========================================================
@@ -404,42 +436,72 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     side_1h = psar_side(bars_1h)
     entry_flip = psar_flip_signal(bars_15m)
 
+    recent_bull_4h = is_recent_bull_flip(bars_4h, RECENT_FLIP_MAX_BARS)
+    recent_bull_1h = is_recent_bull_flip(bars_1h, RECENT_FLIP_MAX_BARS)
+    recent_bear_4h = is_recent_bear_flip(bars_4h, RECENT_FLIP_MAX_BARS)
+    recent_bear_1h = is_recent_bear_flip(bars_1h, RECENT_FLIP_MAX_BARS)
+
     close_15m = bars_15m[-1][4]
     above_ema = close_15m > ema50_15m
     below_ema = close_15m < ema50_15m
+    distance_from_ema50 = abs(close_15m - ema50_15m) / ema50_15m if ema50_15m > 0 else 999
 
-    if side_4h == "BULL" and side_1h == "BULL" and entry_flip == "LONG" and above_ema:
+    if recent_bull_4h and recent_bull_1h and entry_flip == "LONG" and above_ema and distance_from_ema50 <= MAX_DISTANCE_FROM_EMA50:
         return {
             "symbol": symbol,
             "signal": "LONG",
-            "reason": "4H+1H bullish SAR, 15m bullish SAR flip, above EMA50",
+            "reason": "Recent 4H+1H bullish SAR start, 15m bullish SAR flip, near EMA50",
             "bars_15m": bars_15m,
             "close_15m": close_15m,
             "atr_15m": atr_15m,
         }
 
-    if side_4h == "BEAR" and side_1h == "BEAR" and entry_flip == "SHORT" and below_ema:
+    if recent_bear_4h and recent_bear_1h and entry_flip == "SHORT" and below_ema and distance_from_ema50 <= MAX_DISTANCE_FROM_EMA50:
         return {
             "symbol": symbol,
             "signal": "SHORT",
-            "reason": "4H+1H bearish SAR, 15m bearish SAR flip, below EMA50",
+            "reason": "Recent 4H+1H bearish SAR start, 15m bearish SAR flip, near EMA50",
             "bars_15m": bars_15m,
             "close_15m": close_15m,
             "atr_15m": atr_15m,
         }
 
-    # Human-readable radar reason
     if side_4h == "BULL" and side_1h == "BULL":
+        if not (recent_bull_4h and recent_bull_1h):
+            return {
+                "symbol": symbol,
+                "signal": "WAIT",
+                "reason": "Bull trend exists but not early enough on 4H/1H",
+            }
+        if distance_from_ema50 > MAX_DISTANCE_FROM_EMA50:
+            return {
+                "symbol": symbol,
+                "signal": "WAIT",
+                "reason": "Bull trend active but price is too far from EMA50",
+            }
         return {
             "symbol": symbol,
             "signal": "WAIT",
-            "reason": "Bull trend active, waiting 15m bullish SAR flip",
+            "reason": "Early bull trend active, waiting 15m bullish SAR flip",
         }
+
     if side_4h == "BEAR" and side_1h == "BEAR":
+        if not (recent_bear_4h and recent_bear_1h):
+            return {
+                "symbol": symbol,
+                "signal": "WAIT",
+                "reason": "Bear trend exists but not early enough on 4H/1H",
+            }
+        if distance_from_ema50 > MAX_DISTANCE_FROM_EMA50:
+            return {
+                "symbol": symbol,
+                "signal": "WAIT",
+                "reason": "Bear trend active but price is too far from EMA50",
+            }
         return {
             "symbol": symbol,
             "signal": "WAIT",
-            "reason": "Bear trend active, waiting 15m bearish SAR flip",
+            "reason": "Early bear trend active, waiting 15m bearish SAR flip",
         }
 
     return {
