@@ -309,8 +309,12 @@ def psar_flip_signal(ohlcv: List[List[float]]) -> Optional[str]:
 # =========================================================
 def fetch_balance_usdt() -> float:
     try:
-        bal = exchange.fetch_balance()
-        return safe_float(bal["USDT"]["free"])
+        bal = exchange.fetch_balance({"type": "swap"})
+        if isinstance(bal.get("USDT"), dict):
+            return safe_float(bal["USDT"].get("free", 0.0))
+        if isinstance(bal.get("free"), dict):
+            return safe_float(bal["free"].get("USDT", 0.0))
+        return 0.0
     except Exception as e:
         logger.error(f"Balance error: {e}")
         return 0.0
@@ -318,7 +322,7 @@ def fetch_balance_usdt() -> float:
 
 def fetch_positions() -> List[dict]:
     try:
-        return exchange.fetch_positions()
+        return exchange.fetch_positions(params={"type": "swap"})
     except Exception as e:
         logger.error(f"fetch_positions error: {e}")
         return []
@@ -326,7 +330,7 @@ def fetch_positions() -> List[dict]:
 
 def get_symbol_position(symbol: str) -> Optional[dict]:
     try:
-        positions = exchange.fetch_positions([symbol])
+        positions = exchange.fetch_positions([symbol], params={"type": "swap"})
         for p in positions:
             if safe_float(p.get("contracts", 0)) != 0:
                 return p
@@ -354,13 +358,28 @@ def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> Optional[List[L
 
 def set_leverage_and_margin(symbol: str, leverage: int) -> None:
     try:
+        exchange.set_position_mode(False, symbol)
+    except Exception as e:
+        logger.warning(f"{symbol}: set position mode warning: {e}")
+
+    try:
         exchange.set_margin_mode(MARGIN_MODE, symbol)
     except Exception as e:
         logger.warning(f"{symbol}: set margin mode warning: {e}")
+
     try:
-        exchange.set_leverage(leverage, symbol)
+        exchange.set_leverage(leverage, symbol, {"side": "BOTH"})
     except Exception as e:
         logger.warning(f"{symbol}: set leverage warning: {e}")
+
+
+def get_order_params(reduce_only: bool = False) -> dict:
+    params = {
+        "positionSide": "BOTH",
+    }
+    if reduce_only:
+        params["reduceOnly"] = True
+    return params
 
 
 # =========================================================
@@ -482,7 +501,13 @@ def open_position(symbol: str, side: str, plan: dict) -> bool:
     order_side = "buy" if side == "LONG" else "sell"
     try:
         set_leverage_and_margin(symbol, DEFAULT_LEVERAGE)
-        order = exchange.create_market_order(symbol, order_side, plan["amount"])
+
+        order = exchange.create_market_order(
+            symbol,
+            order_side,
+            plan["amount"],
+            params=get_order_params(reduce_only=False),
+        )
         logger.info(f"{symbol}: opened {side} -> {order.get('id')}")
 
         trade_state[symbol] = {
@@ -521,7 +546,7 @@ def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
             symbol,
             close_side,
             amount,
-            params={"reduceOnly": True}
+            params=get_order_params(reduce_only=True),
         )
         return True
     except Exception as e:
@@ -782,6 +807,8 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                 scan_lines.append(f"{symbol}: OPENED {signal}")
                 if count_open_positions() >= MAX_OPEN_POSITIONS:
                     break
+            else:
+                scan_lines.append(f"{symbol}: OPEN_FAILED")
 
         except Exception as e:
             logger.error(f"{symbol}: trading_job error: {e}")
