@@ -75,9 +75,13 @@ TRAILING_ATR_MULTIPLIER = 1.2
 SCAN_INTERVAL_SECONDS = 60
 POSITION_CHECK_INTERVAL_SECONDS = 20
 
-# New strategy filters
+# Current strategy filters
 RECENT_FLIP_MAX_BARS = 3
 MAX_DISTANCE_FROM_EMA50 = 0.01  # 1%
+
+# Early Entry Mode
+EARLY_FLIP_MAX_BARS = 6
+EARLY_MAX_DISTANCE_FROM_EMA50 = 0.02  # 2%
 
 logging.basicConfig(
     level=logging.INFO,
@@ -441,11 +445,19 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     recent_bear_4h = is_recent_bear_flip(bars_4h, RECENT_FLIP_MAX_BARS)
     recent_bear_1h = is_recent_bear_flip(bars_1h, RECENT_FLIP_MAX_BARS)
 
+    early_bull_4h = is_recent_bull_flip(bars_4h, EARLY_FLIP_MAX_BARS)
+    early_bull_1h = is_recent_bull_flip(bars_1h, EARLY_FLIP_MAX_BARS)
+    early_bear_4h = is_recent_bear_flip(bars_4h, EARLY_FLIP_MAX_BARS)
+    early_bear_1h = is_recent_bear_flip(bars_1h, EARLY_FLIP_MAX_BARS)
+
     close_15m = bars_15m[-1][4]
     above_ema = close_15m > ema50_15m
     below_ema = close_15m < ema50_15m
     distance_from_ema50 = abs(close_15m - ema50_15m) / ema50_15m if ema50_15m > 0 else 999
 
+    # =========================
+    # NORMAL ENTRY
+    # =========================
     if recent_bull_4h and recent_bull_1h and entry_flip == "LONG" and above_ema and distance_from_ema50 <= MAX_DISTANCE_FROM_EMA50:
         return {
             "symbol": symbol,
@@ -466,6 +478,32 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
             "atr_15m": atr_15m,
         }
 
+    # =========================
+    # EARLY ENTRY MODE (display only for now)
+    # =========================
+    if early_bull_4h and early_bull_1h and above_ema and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50:
+        return {
+            "symbol": symbol,
+            "signal": "EARLY_LONG",
+            "reason": "Early bull trend detected on 4H+1H, waiting cleaner confirmation",
+            "bars_15m": bars_15m,
+            "close_15m": close_15m,
+            "atr_15m": atr_15m,
+        }
+
+    if early_bear_4h and early_bear_1h and below_ema and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50:
+        return {
+            "symbol": symbol,
+            "signal": "EARLY_SHORT",
+            "reason": "Early bear trend detected on 4H+1H, waiting cleaner confirmation",
+            "bars_15m": bars_15m,
+            "close_15m": close_15m,
+            "atr_15m": atr_15m,
+        }
+
+    # =========================
+    # WAIT STATES
+    # =========================
     if side_4h == "BULL" and side_1h == "BULL":
         if not (recent_bull_4h and recent_bull_1h):
             return {
@@ -836,6 +874,9 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
 
             scan_lines.append(f"{symbol}: {signal} | {reason}")
             last_signal_summary = f"{symbol}: {signal} | {reason}"
+
+            if signal in ("EARLY_LONG", "EARLY_SHORT"):
+                continue
 
             if signal not in ("LONG", "SHORT"):
                 continue
