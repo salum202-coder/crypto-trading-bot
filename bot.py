@@ -83,6 +83,11 @@ MAX_DISTANCE_FROM_EMA50 = 0.01  # 1%
 EARLY_FLIP_MAX_BARS = 6
 EARLY_MAX_DISTANCE_FROM_EMA50 = 0.02  # 2%
 
+# RSI filter (added only)
+RSI_PERIOD = 14
+EARLY_LONG_MAX_RSI = 65
+EARLY_SHORT_MIN_RSI = 35
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -194,6 +199,35 @@ def ema(values: List[float], period: int) -> Optional[float]:
     for x in values[period:]:
         val = x * k + val * (1 - k)
     return val
+
+
+def rsi(values: List[float], period: int = RSI_PERIOD) -> Optional[float]:
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, period + 1):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    for i in range(period + 1, len(values)):
+        diff = values[i] - values[i - 1]
+        gain = max(diff, 0.0)
+        loss = max(-diff, 0.0)
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
 def atr_from_ohlcv(ohlcv: List[List[float]], period: int) -> Optional[float]:
@@ -432,8 +466,9 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     closes_15m = [b[4] for b in bars_15m]
     ema50_15m = ema(closes_15m, EMA_FILTER_PERIOD)
     atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
+    rsi_15m = rsi(closes_15m, RSI_PERIOD)
 
-    if ema50_15m is None or atr_15m is None:
+    if ema50_15m is None or atr_15m is None or rsi_15m is None:
         return None
 
     side_4h = psar_side(bars_4h)
@@ -479,9 +514,15 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
         }
 
     # =========================
-    # EARLY ENTRY MODE
+    # EARLY ENTRY MODE + RSI FILTER
     # =========================
-    if early_bull_4h and early_bull_1h and above_ema and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50:
+    if (
+        early_bull_4h
+        and early_bull_1h
+        and above_ema
+        and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50
+        and rsi_15m <= EARLY_LONG_MAX_RSI
+    ):
         return {
             "symbol": symbol,
             "signal": "EARLY_LONG",
@@ -491,7 +532,13 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
             "atr_15m": atr_15m,
         }
 
-    if early_bear_4h and early_bear_1h and below_ema and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50:
+    if (
+        early_bear_4h
+        and early_bear_1h
+        and below_ema
+        and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50
+        and rsi_15m >= EARLY_SHORT_MIN_RSI
+    ):
         return {
             "symbol": symbol,
             "signal": "EARLY_SHORT",
