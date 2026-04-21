@@ -479,7 +479,7 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
         }
 
     # =========================
-    # EARLY ENTRY MODE (display only for now)
+    # EARLY ENTRY MODE
     # =========================
     if early_bull_4h and early_bull_1h and above_ema and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50:
         return {
@@ -549,7 +549,13 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     }
 
 
-def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float) -> Optional[dict]:
+def calculate_trade_plan(
+    symbol: str,
+    snapshot: dict,
+    side: str,
+    balance: float,
+    risk_multiplier: float = 1.0,
+) -> Optional[dict]:
     entry = snapshot["close_15m"]
     atr_15m = snapshot["atr_15m"]
     bars_15m = snapshot["bars_15m"]
@@ -568,7 +574,8 @@ def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float)
     if risk_per_unit <= 0:
         return None
 
-    risk_amount = balance * risk_per_trade
+    effective_risk = risk_per_trade * risk_multiplier
+    risk_amount = balance * effective_risk
     raw_amount = risk_amount / risk_per_unit
     amount = normalize_amount(symbol, raw_amount)
 
@@ -591,6 +598,7 @@ def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float)
         "amount": amount,
         "risk_amount": risk_amount,
         "risk_per_unit": risk_per_unit,
+        "effective_risk": effective_risk,
     }
 
 
@@ -875,10 +883,22 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
             scan_lines.append(f"{symbol}: {signal} | {reason}")
             last_signal_summary = f"{symbol}: {signal} | {reason}"
 
-            if signal in ("EARLY_LONG", "EARLY_SHORT"):
-                continue
+            entry_side = None
+            risk_multiplier = 1.0
 
-            if signal not in ("LONG", "SHORT"):
+            if signal == "LONG":
+                entry_side = "LONG"
+                risk_multiplier = 1.0
+            elif signal == "SHORT":
+                entry_side = "SHORT"
+                risk_multiplier = 1.0
+            elif signal == "EARLY_LONG":
+                entry_side = "LONG"
+                risk_multiplier = 0.5
+            elif signal == "EARLY_SHORT":
+                entry_side = "SHORT"
+                risk_multiplier = 0.5
+            else:
                 continue
 
             balance = fetch_balance_usdt()
@@ -886,25 +906,26 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                 scan_lines.append(f"{symbol}: LOW_BALANCE")
                 continue
 
-            plan = calculate_trade_plan(symbol, snapshot, signal, balance)
+            plan = calculate_trade_plan(symbol, snapshot, entry_side, balance, risk_multiplier=risk_multiplier)
             if not plan:
                 scan_lines.append(f"{symbol}: PLAN_REJECTED")
                 continue
 
-            if open_position(symbol, signal, plan):
+            if open_position(symbol, entry_side, plan):
                 await notify(
                     context,
                     (
                         f"🚀 Trade Opened\n"
                         f"Symbol: {symbol}\n"
                         f"Side: {signal}\n"
+                        f"Execution Side: {entry_side}\n"
                         f"Reason: {reason}\n"
                         f"Entry: {format_num(plan['entry'], 6)}\n"
                         f"SL: {format_num(plan['stop_loss'], 6)}\n"
                         f"TP1: {format_num(plan['tp1'], 6)}\n"
                         f"TP2: {format_num(plan['tp2'], 6)}\n"
                         f"Amount: {plan['amount']}\n"
-                        f"Risk: {format_num(risk_per_trade * 100, 2)}%"
+                        f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%"
                     )
                 )
                 scan_lines.append(f"{symbol}: OPENED {signal}")
