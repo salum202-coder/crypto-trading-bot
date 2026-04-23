@@ -1,8 +1,10 @@
 import os
+import json
 import asyncio
 import time
 import logging
 import threading
+from pathlib import Path
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, Dict, Any, List
@@ -83,10 +85,13 @@ MAX_DISTANCE_FROM_EMA50 = 0.01  # 1%
 EARLY_FLIP_MAX_BARS = 6
 EARLY_MAX_DISTANCE_FROM_EMA50 = 0.02  # 2%
 
-# RSI filter (added only)
+# RSI filter
 RSI_PERIOD = 14
 EARLY_LONG_MAX_RSI = 65
 EARLY_SHORT_MIN_RSI = 35
+
+# Persistent stats file
+STATS_FILE = Path("stats.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,13 +117,8 @@ last_scan_summary = "No scans yet."
 last_signal_summary = "No signals yet."
 bot_paused = False
 
-daily_stats = {
-    "date": datetime.now(timezone.utc).date().isoformat(),
-    "closed_trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "realized_pnl": 0.0,
-}
+daily_stats = {}
+all_stats = {}
 
 # =========================================================
 # 3) HELPERS
@@ -129,19 +129,6 @@ def now_ts() -> int:
 
 def utc_today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
-
-
-def reset_daily_stats_if_needed() -> None:
-    global daily_stats
-    today = utc_today()
-    if daily_stats["date"] != today:
-        daily_stats = {
-            "date": today,
-            "closed_trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "realized_pnl": 0.0,
-        }
 
 
 def safe_float(value, default: float = 0.0) -> float:
@@ -372,6 +359,178 @@ def is_recent_bear_flip(ohlcv: List[List[float]], max_bars: int) -> bool:
     side = psar_side(ohlcv)
     bars_ago = psar_flip_bars_ago(ohlcv)
     return side == "BEAR" and bars_ago is not None and bars_ago <= max_bars
+
+
+# =========================================================
+# 3.1) STATS PERSISTENCE
+# =========================================================
+def empty_daily_stats() -> dict:
+    return {
+        "date": utc_today(),
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+    }
+
+
+def empty_all_stats() -> dict:
+    return {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+        "best_win": 0.0,
+        "worst_loss": 0.0,
+        "by_symbol": {},
+    }
+
+
+def save_stats_to_disk() -> None:
+    try:
+        payload = {
+            "daily_stats": daily_stats,
+            "all_stats": all_stats,
+        }
+        STATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save_stats_to_disk error: {e}")
+
+
+def load_stats_from_disk() -> None:
+    global daily_stats, all_stats
+
+    if not STATS_FILE.exists():
+        daily_stats = empty_daily_stats()
+        all_stats = empty_all_stats()
+        save_stats_to_disk()
+        return
+
+    try:
+        raw = json.loads(STATS_FILE.read_text(encoding="utf-8"))
+        daily_stats = raw.get("daily_stats") or empty_daily_stats()
+        all_stats = raw.get("all_stats") or empty_all_stats()
+    except Exception as e:
+        logger.error(f"load_stats_from_disk error: {e}")
+        daily_stats = empty_daily_stats()
+        all_stats = empty_all_stats()
+        save_stats_to_disk()
+
+    # Ensure schema
+    daily_stats.setdefault("date", utc_today())
+    daily_stats.setdefault("closed_trades", 0)
+    daily_stats.setdefault("wins", 0)
+    daily_stats.setdefault("losses", 0)
+    daily_stats.setdefault("realized_pnl", 0.0)
+
+    all_stats.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+    all_stats.setdefault("closed_trades", 0)
+    all_stats.setdefault("wins", 0)
+    all_stats.setdefault("losses", 0)
+    all_stats.setdefault("realized_pnl", 0.0)
+    all_stats.setdefault("best_win", 0.0)
+    all_stats.setdefault("worst_loss", 0.0)
+    all_stats.setdefault("by_symbol", {})
+
+    save_stats_to_disk()
+
+
+def reset_daily_stats_if_needed() -> None:
+    global daily_stats
+    today = utc_today()
+    if daily_stats.get("date") != today:
+        daily_stats = empty_daily_stats()
+        save_stats_to_disk()
+
+
+def update_symbol_stats(symbol: str, pnl_pct: float) -> None:
+    symbol_stats = all_stats["by_symbol"].get(symbol, {
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+        "best_win": 0.0,
+        "worst_loss": 0.0,
+    })
+
+    symbol_stats["closed_trades"] += 1
+    symbol_stats["realized_pnl"] += pnl_pct
+
+    if pnl_pct >= 0:
+        symbol_stats["wins"] += 1
+        symbol_stats["best_win"] = max(safe_float(symbol_stats.get("best_win", 0.0)), pnl_pct)
+    else:
+        symbol_stats["losses"] += 1
+        symbol_stats["worst_loss"] = min(safe_float(symbol_stats.get("worst_loss", 0.0)), pnl_pct)
+
+    all_stats["by_symbol"][symbol] = symbol_stats
+
+
+def build_today_stats_text() -> str:
+    reset_daily_stats_if_needed()
+    win_rate = 0.0
+    if daily_stats["closed_trades"] > 0:
+        win_rate = (daily_stats["wins"] / daily_stats["closed_trades"]) * 100
+
+    return (
+        f"📈 إحصائيات اليوم\n"
+        f"التاريخ: {daily_stats['date']}\n"
+        f"الصفقات المغلقة: {daily_stats['closed_trades']}\n"
+        f"الرابحة: {daily_stats['wins']}\n"
+        f"الخاسرة: {daily_stats['losses']}\n"
+        f"نسبة النجاح: {win_rate:.2f}%\n"
+        f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%"
+    )
+
+
+def build_all_stats_text() -> str:
+    total = all_stats["closed_trades"]
+    wins = all_stats["wins"]
+    losses = all_stats["losses"]
+    pnl = all_stats["realized_pnl"]
+    best_win = all_stats["best_win"]
+    worst_loss = all_stats["worst_loss"]
+
+    win_rate = 0.0
+    if total > 0:
+        win_rate = (wins / total) * 100
+
+    return (
+        f"📊 الإحصائيات الكاملة\n"
+        f"منذ: {all_stats['started_at'][:10]}\n"
+        f"إجمالي الصفقات المغلقة: {total}\n"
+        f"الرابحة: {wins}\n"
+        f"الخاسرة: {losses}\n"
+        f"نسبة النجاح: {win_rate:.2f}%\n"
+        f"إجمالي PnL%: {pnl:.2f}%\n"
+        f"أفضل صفقة: {best_win:.2f}%\n"
+        f"أسوأ صفقة: {worst_loss:.2f}%"
+    )
+
+
+def build_best_symbols_text(limit: int = 5) -> str:
+    stats_by_symbol = all_stats.get("by_symbol", {})
+    if not stats_by_symbol:
+        return "📌 لا توجد بيانات صفقات كافية بعد."
+
+    ranked = sorted(
+        stats_by_symbol.items(),
+        key=lambda item: safe_float(item[1].get("realized_pnl", 0.0)),
+        reverse=True,
+    )[:limit]
+
+    lines = ["🏆 أفضل العملات أداءً:"]
+    for symbol, data in ranked:
+        total = int(data.get("closed_trades", 0))
+        pnl = safe_float(data.get("realized_pnl", 0.0))
+        wins = int(data.get("wins", 0))
+        losses = int(data.get("losses", 0))
+        win_rate = (wins / total * 100) if total > 0 else 0.0
+        lines.append(
+            f"{symbol} | Trades: {total} | WinRate: {win_rate:.1f}% | PnL: {pnl:.2f}%"
+        )
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -709,7 +868,7 @@ def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
         return False
 
 
-def record_closed_trade(entry_price: float, exit_price: float, side: str) -> None:
+def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side: str) -> None:
     reset_daily_stats_if_needed()
 
     pnl_pct = 0.0
@@ -725,6 +884,18 @@ def record_closed_trade(entry_price: float, exit_price: float, side: str) -> Non
         daily_stats["wins"] += 1
     else:
         daily_stats["losses"] += 1
+
+    all_stats["closed_trades"] += 1
+    all_stats["realized_pnl"] += pnl_pct
+    if pnl_pct >= 0:
+        all_stats["wins"] += 1
+        all_stats["best_win"] = max(safe_float(all_stats.get("best_win", 0.0)), pnl_pct)
+    else:
+        all_stats["losses"] += 1
+        all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
+
+    update_symbol_stats(symbol, pnl_pct)
+    save_stats_to_disk()
 
 
 async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: str, reason: str, entry: float, exit_price: float) -> None:
@@ -796,7 +967,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
         if side == "LONG":
             if mark_price <= state["stop_loss"]:
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
@@ -834,7 +1005,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 if mark_price <= state["trailing_stop"]:
                     refreshed = get_symbol_position(symbol) or pos
                     if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(entry_price, mark_price, side)
+                        record_closed_trade(symbol, entry_price, mark_price, side)
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
                         set_cooldown(symbol)
@@ -843,7 +1014,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
         else:
             if mark_price >= state["stop_loss"]:
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
@@ -881,7 +1052,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 if mark_price >= state["trailing_stop"]:
                     refreshed = get_symbol_position(symbol) or pos
                     if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(entry_price, mark_price, side)
+                        record_closed_trade(symbol, entry_price, mark_price, side)
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
                         set_cooldown(symbol)
@@ -1000,7 +1171,11 @@ def dashboard_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📂 الصفقات", callback_data="dash_positions"),
-            InlineKeyboardButton("📈 الإحصائيات", callback_data="dash_stats"),
+            InlineKeyboardButton("📈 اليوم", callback_data="dash_stats"),
+        ],
+        [
+            InlineKeyboardButton("📊 الكل", callback_data="dash_allstats"),
+            InlineKeyboardButton("🏆 الأفضل", callback_data="dash_best"),
         ],
         [
             InlineKeyboardButton("🔎 فحص يدوي", callback_data="dash_scan"),
@@ -1150,20 +1325,15 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reset_daily_stats_if_needed()
-    win_rate = 0.0
-    if daily_stats["closed_trades"] > 0:
-        win_rate = (daily_stats["wins"] / daily_stats["closed_trades"]) * 100
+    await update.message.reply_text(build_today_stats_text())
 
-    await update.message.reply_text(
-        f"📈 إحصائيات اليوم\n"
-        f"التاريخ: {daily_stats['date']}\n"
-        f"الصفقات المغلقة: {daily_stats['closed_trades']}\n"
-        f"الرابحة: {daily_stats['wins']}\n"
-        f"الخاسرة: {daily_stats['losses']}\n"
-        f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%"
-    )
+
+async def cmd_allstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_all_stats_text())
+
+
+async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_best_symbols_text())
 
 
 async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1194,19 +1364,13 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_positions(query.message, fetch_positions())
 
     elif data == "dash_stats":
-        reset_daily_stats_if_needed()
-        win_rate = 0.0
-        if daily_stats["closed_trades"] > 0:
-            win_rate = (daily_stats["wins"] / daily_stats["closed_trades"]) * 100
-        await query.message.reply_text(
-            f"📈 إحصائيات اليوم\n"
-            f"التاريخ: {daily_stats['date']}\n"
-            f"الصفقات المغلقة: {daily_stats['closed_trades']}\n"
-            f"الرابحة: {daily_stats['wins']}\n"
-            f"الخاسرة: {daily_stats['losses']}\n"
-            f"نسبة النجاح: {win_rate:.2f}%\n"
-            f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%"
-        )
+        await query.message.reply_text(build_today_stats_text())
+
+    elif data == "dash_allstats":
+        await query.message.reply_text(build_all_stats_text())
+
+    elif data == "dash_best":
+        await query.message.reply_text(build_best_symbols_text())
 
     elif data == "dash_scan":
         await query.message.reply_text("🔎 جاري الفحص اليدوي...")
@@ -1260,6 +1424,8 @@ class HealthHandler(BaseHTTPRequestHandler):
 # 12) MAIN
 # =========================================================
 def main():
+    load_stats_from_disk()
+
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
         daemon=True,
@@ -1287,6 +1453,8 @@ def main():
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("allstats", cmd_allstats))
+    app.add_handler(CommandHandler("best", cmd_best))
     app.add_handler(CommandHandler("closeall", cmd_close_all))
     app.add_handler(CallbackQueryHandler(dashboard_handler))
 
