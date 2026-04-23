@@ -47,7 +47,6 @@ SYMBOLS = [
     "LINK/USDT:USDT",
     "AVAX/USDT:USDT",
     "LTC/USDT:USDT",
-    "DOT/USDT:USDT",
     "TRX/USDT:USDT",
     "BCH/USDT:USDT",
     "ATOM/USDT:USDT",
