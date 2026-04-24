@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -57,37 +57,42 @@ TF_4H = "4h"
 TF_1H = "1h"
 TF_15M = "15m"
 
-MAX_OPEN_POSITIONS = 3
-COOLDOWN_MINUTES = 45
+MAX_OPEN_POSITIONS = 2
+COOLDOWN_MINUTES = 60
 
 # Risk can be changed from Telegram
-risk_per_trade = 0.006  # 0.6%
+risk_per_trade = 0.005  # 0.5%
 
-EMA_FILTER_PERIOD = 50
 ATR_PERIOD = 14
+RSI_PERIOD = 14
+EMA_FAST_PERIOD = 20
+VOLUME_SMA_PERIOD = 20
 
-SAR_AF = 0.02
-SAR_MAX_AF = 0.2
+# Ichimoku settings
+ICHIMOKU_TENKAN = 9
+ICHIMOKU_KIJUN = 26
+ICHIMOKU_SENKOU_B = 52
+ICHIMOKU_DISPLACEMENT = 26
 
-TP1_R = 1.0
-TP2_R = 2.0
-TRAILING_ATR_MULTIPLIER = 1.2
+# Smart score thresholds
+ENTRY_SCORE = 82
+WATCH_SCORE = 70
+MIN_RR = 1.35
+
+# Entry filters
+MAX_DISTANCE_FROM_KIJUN_15M = 0.018  # 1.8%
+MAX_ATR_PERCENT_15M = 0.035          # avoid crazy volatility
+MIN_ATR_PERCENT_15M = 0.0015         # avoid dead market
+
+# Exit logic
+TP1_R = 0.9
+TP2_R = 1.8
+TRAILING_ATR_MULTIPLIER = 1.15
+EARLY_EXIT_SCORE = 45
+EMERGENCY_EXIT_SCORE = 35
 
 SCAN_INTERVAL_SECONDS = 60
 POSITION_CHECK_INTERVAL_SECONDS = 20
-
-# Current strategy filters
-RECENT_FLIP_MAX_BARS = 3
-MAX_DISTANCE_FROM_EMA50 = 0.01  # 1%
-
-# Early Entry Mode
-EARLY_FLIP_MAX_BARS = 6
-EARLY_MAX_DISTANCE_FROM_EMA50 = 0.02  # 2%
-
-# RSI filter
-RSI_PERIOD = 14
-EARLY_LONG_MAX_RSI = 65
-EARLY_SHORT_MIN_RSI = 35
 
 # Persistent stats file
 STATS_FILE = Path("stats.json")
@@ -96,7 +101,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("SAR_MTF_Bot")
+logger = logging.getLogger("ICHIMOKU_SMART_BOT")
 
 exchange = ccxt.bingx({
     "apiKey": BINGX_API_KEY,
@@ -120,7 +125,7 @@ daily_stats = {}
 all_stats = {}
 
 # =========================================================
-# 3) HELPERS
+# 3) BASIC HELPERS
 # =========================================================
 def now_ts() -> int:
     return int(time.time())
@@ -249,119 +254,294 @@ def normalize_price(symbol: str, price: float) -> float:
         return price
 
 
-def calc_psar(ohlcv: List[List[float]], af_start: float = SAR_AF, af_max: float = SAR_MAX_AF) -> Optional[List[float]]:
-    if len(ohlcv) < 5:
+# =========================================================
+# 3.1) ICHIMOKU HELPERS
+# =========================================================
+def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> Optional[float]:
+    start = end_index - period + 1
+    if start < 0:
+        return None
+    window = ohlcv[start:end_index + 1]
+    high = max(c[2] for c in window)
+    low = min(c[3] for c in window)
+    return (high + low) / 2
+
+
+def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
+    """
+    Practical Ichimoku snapshot for bot decisions.
+    For current cloud, we compare price with the cloud values projected from 26 candles ago.
+    """
+    required = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 5
+    if len(ohlcv) < required:
         return None
 
-    highs = [c[2] for c in ohlcv]
-    lows = [c[3] for c in ohlcv]
+    last = len(ohlcv) - 1
+    cloud_source = last - ICHIMOKU_DISPLACEMENT
 
-    psar = [0.0] * len(ohlcv)
+    tenkan_now = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, last)
+    kijun_now = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, last)
 
-    bull = True
-    if highs[1] + lows[1] < highs[0] + lows[0]:
-        bull = False
+    tenkan_cloud = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, cloud_source)
+    kijun_cloud = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, cloud_source)
+    span_b_current = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, cloud_source)
 
-    af = af_start
-    ep = highs[0] if bull else lows[0]
-    psar[0] = lows[0] if bull else highs[0]
-
-    for i in range(1, len(ohlcv)):
-        prev_psar = psar[i - 1]
-        current_psar = prev_psar + af * (ep - prev_psar)
-
-        if bull:
-            if i >= 2:
-                current_psar = min(current_psar, lows[i - 1], lows[i - 2])
-            else:
-                current_psar = min(current_psar, lows[i - 1])
-
-            if lows[i] < current_psar:
-                bull = False
-                current_psar = ep
-                ep = lows[i]
-                af = af_start
-            else:
-                if highs[i] > ep:
-                    ep = highs[i]
-                    af = min(af + af_start, af_max)
-        else:
-            if i >= 2:
-                current_psar = max(current_psar, highs[i - 1], highs[i - 2])
-            else:
-                current_psar = max(current_psar, highs[i - 1])
-
-            if highs[i] > current_psar:
-                bull = True
-                current_psar = ep
-                ep = highs[i]
-                af = af_start
-            else:
-                if lows[i] < ep:
-                    ep = lows[i]
-                    af = min(af + af_start, af_max)
-
-        psar[i] = current_psar
-
-    return psar
-
-
-def psar_side(ohlcv: List[List[float]]) -> Optional[str]:
-    psar = calc_psar(ohlcv)
-    if not psar:
+    if tenkan_now is None or kijun_now is None or tenkan_cloud is None or kijun_cloud is None or span_b_current is None:
         return None
+
+    span_a_current = (tenkan_cloud + kijun_cloud) / 2
+    cloud_top = max(span_a_current, span_b_current)
+    cloud_bottom = min(span_a_current, span_b_current)
     close = ohlcv[-1][4]
-    return "BULL" if psar[-1] < close else "BEAR"
 
-
-def psar_flip_signal(ohlcv: List[List[float]]) -> Optional[str]:
-    psar = calc_psar(ohlcv)
-    if not psar or len(psar) < 3:
+    # Future cloud from current candle.
+    span_a_future = (tenkan_now + kijun_now) / 2
+    span_b_future = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, last)
+    if span_b_future is None:
         return None
 
-    prev_close = ohlcv[-2][4]
-    curr_close = ohlcv[-1][4]
+    if close > cloud_top:
+        price_vs_cloud = "ABOVE"
+    elif close < cloud_bottom:
+        price_vs_cloud = "BELOW"
+    else:
+        price_vs_cloud = "INSIDE"
 
-    prev_bull = psar[-2] < prev_close
-    curr_bull = psar[-1] < curr_close
+    tk_bias = "BULL" if tenkan_now > kijun_now else "BEAR" if tenkan_now < kijun_now else "FLAT"
+    future_cloud_bias = "BULL" if span_a_future > span_b_future else "BEAR" if span_a_future < span_b_future else "FLAT"
+    cloud_thickness = abs(cloud_top - cloud_bottom) / close if close > 0 else 999
 
-    if (not prev_bull) and curr_bull:
-        return "LONG"
-    if prev_bull and (not curr_bull):
-        return "SHORT"
-    return None
-
-
-def psar_flip_bars_ago(ohlcv: List[List[float]]) -> Optional[int]:
-    psar = calc_psar(ohlcv)
-    if not psar or len(psar) < 4:
-        return None
-
-    bull_states = []
-    for i in range(len(ohlcv)):
-        close_i = ohlcv[i][4]
-        bull_states.append(psar[i] < close_i)
-
-    for i in range(len(bull_states) - 1, 0, -1):
-        if bull_states[i] != bull_states[i - 1]:
-            return (len(bull_states) - 1) - i
-    return None
+    return {
+        "tenkan": tenkan_now,
+        "kijun": kijun_now,
+        "span_a_current": span_a_current,
+        "span_b_current": span_b_current,
+        "cloud_top": cloud_top,
+        "cloud_bottom": cloud_bottom,
+        "price_vs_cloud": price_vs_cloud,
+        "tk_bias": tk_bias,
+        "future_cloud_bias": future_cloud_bias,
+        "cloud_thickness": cloud_thickness,
+    }
 
 
-def is_recent_bull_flip(ohlcv: List[List[float]], max_bars: int) -> bool:
-    side = psar_side(ohlcv)
-    bars_ago = psar_flip_bars_ago(ohlcv)
-    return side == "BULL" and bars_ago is not None and bars_ago <= max_bars
+def ichimoku_trend(ichi: dict) -> str:
+    if ichi["price_vs_cloud"] == "ABOVE" and ichi["tk_bias"] == "BULL":
+        return "BULL"
+    if ichi["price_vs_cloud"] == "BELOW" and ichi["tk_bias"] == "BEAR":
+        return "BEAR"
+    if ichi["price_vs_cloud"] == "INSIDE":
+        return "RANGE"
+    return "MIXED"
 
 
-def is_recent_bear_flip(ohlcv: List[List[float]], max_bars: int) -> bool:
-    side = psar_side(ohlcv)
-    bars_ago = psar_flip_bars_ago(ohlcv)
-    return side == "BEAR" and bars_ago is not None and bars_ago <= max_bars
+def candle_strength(ohlcv: List[List[float]]) -> dict:
+    if len(ohlcv) < 3:
+        return {"body_ratio": 0.0, "direction": "FLAT"}
+    o, h, l, c = ohlcv[-1][1], ohlcv[-1][2], ohlcv[-1][3], ohlcv[-1][4]
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_ratio = body / rng
+    direction = "BULL" if c > o else "BEAR" if c < o else "FLAT"
+    return {"body_ratio": body_ratio, "direction": direction}
+
+
+def recent_structure(ohlcv: List[List[float]], lookback: int = 8) -> str:
+    if len(ohlcv) < lookback + 3:
+        return "UNKNOWN"
+    highs = [c[2] for c in ohlcv[-lookback:]]
+    lows = [c[3] for c in ohlcv[-lookback:]]
+    if highs[-1] > highs[0] and lows[-1] > lows[0]:
+        return "BULL"
+    if highs[-1] < highs[0] and lows[-1] < lows[0]:
+        return "BEAR"
+    return "RANGE"
+
+
+def volume_ok(ohlcv: List[List[float]]) -> Tuple[bool, float]:
+    if len(ohlcv) < VOLUME_SMA_PERIOD + 1:
+        return False, 0.0
+    vols = [safe_float(c[5]) for c in ohlcv]
+    avg = sma(vols[:-1], VOLUME_SMA_PERIOD)
+    current = vols[-1]
+    if not avg or avg <= 0:
+        return False, 0.0
+    ratio = current / avg
+    return ratio >= 0.9, ratio
+
+
+def score_setup(
+    side: str,
+    bars_4h: List[List[float]],
+    bars_1h: List[List[float]],
+    bars_15m: List[List[float]],
+    ichi_4h: dict,
+    ichi_1h: dict,
+    ichi_15m: dict,
+    atr_15m: float,
+    rsi_15m: float,
+) -> dict:
+    close_15m = bars_15m[-1][4]
+    atr_pct = atr_15m / close_15m if close_15m > 0 else 999
+    candle = candle_strength(bars_15m)
+    structure_15m = recent_structure(bars_15m)
+    vol_ok, vol_ratio = volume_ok(bars_15m)
+
+    score = 0
+    reasons = []
+
+    trend_4h = ichimoku_trend(ichi_4h)
+    trend_1h = ichimoku_trend(ichi_1h)
+    trend_15m = ichimoku_trend(ichi_15m)
+
+    want = "BULL" if side == "LONG" else "BEAR"
+    cloud_side = "ABOVE" if side == "LONG" else "BELOW"
+
+    # 4H macro direction
+    if trend_4h == want:
+        score += 25
+        reasons.append(f"4H {want} فوق/تحت السحابة بشكل واضح")
+    elif ichi_4h["price_vs_cloud"] == cloud_side:
+        score += 15
+        reasons.append("4H السعر في جهة الاتجاه لكن Tenkan/Kijun غير مثالي")
+    elif trend_4h == "RANGE":
+        score -= 25
+        reasons.append("4H داخل السحابة = سوق غير واضح")
+    else:
+        score -= 35
+        reasons.append("4H ضد اتجاه الصفقة")
+
+    # 1H confirmation
+    if trend_1h == want:
+        score += 20
+        reasons.append(f"1H يؤكد الاتجاه {want}")
+    elif ichi_1h["price_vs_cloud"] == cloud_side:
+        score += 10
+        reasons.append("1H في جهة الاتجاه لكن التأكيد متوسط")
+    elif trend_1h == "RANGE":
+        score -= 15
+        reasons.append("1H داخل السحابة")
+    else:
+        score -= 25
+        reasons.append("1H ضد الصفقة")
+
+    # 15m entry condition
+    if trend_15m == want:
+        score += 15
+        reasons.append("15m متوافق للدخول")
+    elif ichi_15m["price_vs_cloud"] == cloud_side:
+        score += 8
+        reasons.append("15m فوق/تحت السحابة لكن الزخم متوسط")
+    else:
+        score -= 12
+        reasons.append("15m غير مناسب للدخول")
+
+    # Pullback quality around Kijun
+    distance_kijun = abs(close_15m - ichi_15m["kijun"]) / ichi_15m["kijun"] if ichi_15m["kijun"] > 0 else 999
+    if distance_kijun <= MAX_DISTANCE_FROM_KIJUN_15M:
+        score += 12
+        reasons.append("الدخول قريب من Kijun وليس مطاردة")
+    else:
+        score -= 10
+        reasons.append("السعر بعيد عن Kijun، احتمال الدخول متأخر")
+
+    # Momentum by Tenkan/Kijun and future cloud
+    if ichi_1h["future_cloud_bias"] == want and ichi_15m["tk_bias"] == want:
+        score += 10
+        reasons.append("زخم Ichimoku داعم")
+    elif ichi_15m["tk_bias"] == want:
+        score += 5
+        reasons.append("زخم 15m داعم جزئيًا")
+
+    # Candle strength
+    if candle["direction"] == want and candle["body_ratio"] >= 0.45:
+        score += 8
+        reasons.append("شمعة الدخول قوية")
+    elif candle["direction"] != want:
+        score -= 8
+        reasons.append("شمعة الدخول عكس الاتجاه")
+
+    # Structure
+    if structure_15m == want:
+        score += 6
+        reasons.append("هيكل 15m داعم")
+    elif structure_15m == "RANGE":
+        score -= 4
+        reasons.append("هيكل 15m عرضي")
+
+    # Volume
+    if vol_ok:
+        score += 5
+        reasons.append(f"الحجم جيد ({vol_ratio:.2f}x)")
+    else:
+        score -= 3
+        reasons.append(f"الحجم ضعيف ({vol_ratio:.2f}x)")
+
+    # Volatility filter
+    if MIN_ATR_PERCENT_15M <= atr_pct <= MAX_ATR_PERCENT_15M:
+        score += 4
+        reasons.append("التذبذب مناسب")
+    elif atr_pct > MAX_ATR_PERCENT_15M:
+        score -= 18
+        reasons.append("التذبذب عالي جدًا")
+    else:
+        score -= 10
+        reasons.append("السوق بارد جدًا")
+
+    # RSI sanity
+    if side == "LONG":
+        if 42 <= rsi_15m <= 68:
+            score += 5
+            reasons.append("RSI مناسب للونق")
+        elif rsi_15m > 75:
+            score -= 12
+            reasons.append("RSI مرتفع جدًا، احتمال مطاردة")
+    else:
+        if 32 <= rsi_15m <= 58:
+            score += 5
+            reasons.append("RSI مناسب للشورت")
+        elif rsi_15m < 25:
+            score -= 12
+            reasons.append("RSI منخفض جدًا، احتمال مطاردة")
+
+    score = max(0, min(100, score))
+
+    return {
+        "score": score,
+        "reasons": reasons,
+        "atr_pct": atr_pct,
+        "distance_kijun": distance_kijun,
+        "trend_4h": trend_4h,
+        "trend_1h": trend_1h,
+        "trend_15m": trend_15m,
+        "volume_ratio": vol_ratio,
+        "rsi": rsi_15m,
+    }
+
+
+def decide_best_side(
+    bars_4h: List[List[float]],
+    bars_1h: List[List[float]],
+    bars_15m: List[List[float]],
+    ichi_4h: dict,
+    ichi_1h: dict,
+    ichi_15m: dict,
+    atr_15m: float,
+    rsi_15m: float,
+) -> Tuple[Optional[str], dict, dict]:
+    long_score = score_setup("LONG", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
+    short_score = score_setup("SHORT", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
+
+    if long_score["score"] > short_score["score"] and long_score["score"] >= WATCH_SCORE:
+        return "LONG", long_score, short_score
+    if short_score["score"] > long_score["score"] and short_score["score"] >= WATCH_SCORE:
+        return "SHORT", short_score, long_score
+
+    return None, long_score, short_score
 
 
 # =========================================================
-# 3.1) STATS PERSISTENCE
+# 3.2) STATS PERSISTENCE
 # =========================================================
 def empty_daily_stats() -> dict:
     return {
@@ -416,7 +596,6 @@ def load_stats_from_disk() -> None:
         all_stats = empty_all_stats()
         save_stats_to_disk()
 
-    # Ensure schema
     daily_stats.setdefault("date", utc_today())
     daily_stats.setdefault("closed_trades", 0)
     daily_stats.setdefault("wins", 0)
@@ -611,146 +790,104 @@ def get_order_params(reduce_only: bool = False) -> dict:
 
 
 # =========================================================
-# 5) STRATEGY
+# 5) STRATEGY - ICHIMOKU SMART
 # =========================================================
+def build_reason_text(reasons: List[str], limit: int = 4) -> str:
+    if not reasons:
+        return "No detailed reason."
+    return " | ".join(reasons[:limit])
+
+
 def get_market_snapshot(symbol: str) -> Optional[dict]:
-    bars_4h = fetch_ohlcv_safe(symbol, TF_4H, 120)
-    bars_1h = fetch_ohlcv_safe(symbol, TF_1H, 120)
-    bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 120)
+    bars_4h = fetch_ohlcv_safe(symbol, TF_4H, 180)
+    bars_1h = fetch_ohlcv_safe(symbol, TF_1H, 180)
+    bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
 
     if not bars_4h or not bars_1h or not bars_15m:
         return None
 
+    ichi_4h = ichimoku_snapshot(bars_4h)
+    ichi_1h = ichimoku_snapshot(bars_1h)
+    ichi_15m = ichimoku_snapshot(bars_15m)
+
     closes_15m = [b[4] for b in bars_15m]
-    ema50_15m = ema(closes_15m, EMA_FILTER_PERIOD)
     atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
     rsi_15m = rsi(closes_15m, RSI_PERIOD)
+    ema20_15m = ema(closes_15m, EMA_FAST_PERIOD)
 
-    if ema50_15m is None or atr_15m is None or rsi_15m is None:
+    if not ichi_4h or not ichi_1h or not ichi_15m or atr_15m is None or rsi_15m is None or ema20_15m is None:
         return None
 
-    side_4h = psar_side(bars_4h)
-    side_1h = psar_side(bars_1h)
-    entry_flip = psar_flip_signal(bars_15m)
-
-    recent_bull_4h = is_recent_bull_flip(bars_4h, RECENT_FLIP_MAX_BARS)
-    recent_bull_1h = is_recent_bull_flip(bars_1h, RECENT_FLIP_MAX_BARS)
-    recent_bear_4h = is_recent_bear_flip(bars_4h, RECENT_FLIP_MAX_BARS)
-    recent_bear_1h = is_recent_bear_flip(bars_1h, RECENT_FLIP_MAX_BARS)
-
-    early_bull_4h = is_recent_bull_flip(bars_4h, EARLY_FLIP_MAX_BARS)
-    early_bull_1h = is_recent_bull_flip(bars_1h, EARLY_FLIP_MAX_BARS)
-    early_bear_4h = is_recent_bear_flip(bars_4h, EARLY_FLIP_MAX_BARS)
-    early_bear_1h = is_recent_bear_flip(bars_1h, EARLY_FLIP_MAX_BARS)
+    best_side, best_score, other_score = decide_best_side(
+        bars_4h,
+        bars_1h,
+        bars_15m,
+        ichi_4h,
+        ichi_1h,
+        ichi_15m,
+        atr_15m,
+        rsi_15m,
+    )
 
     close_15m = bars_15m[-1][4]
-    above_ema = close_15m > ema50_15m
-    below_ema = close_15m < ema50_15m
-    distance_from_ema50 = abs(close_15m - ema50_15m) / ema50_15m if ema50_15m > 0 else 999
 
-    # =========================
-    # NORMAL ENTRY
-    # =========================
-    if recent_bull_4h and recent_bull_1h and entry_flip == "LONG" and above_ema and distance_from_ema50 <= MAX_DISTANCE_FROM_EMA50:
+    base = {
+        "symbol": symbol,
+        "bars_4h": bars_4h,
+        "bars_1h": bars_1h,
+        "bars_15m": bars_15m,
+        "close_15m": close_15m,
+        "atr_15m": atr_15m,
+        "rsi_15m": rsi_15m,
+        "ema20_15m": ema20_15m,
+        "ichi_4h": ichi_4h,
+        "ichi_1h": ichi_1h,
+        "ichi_15m": ichi_15m,
+    }
+
+    if not best_side:
+        long_s = best_score["score"]
+        short_s = other_score["score"]
         return {
-            "symbol": symbol,
-            "signal": "LONG",
-            "reason": "Recent 4H+1H bullish SAR start, 15m bullish SAR flip, near EMA50",
-            "bars_15m": bars_15m,
-            "close_15m": close_15m,
-            "atr_15m": atr_15m,
+            **base,
+            "signal": "NO_TRADE",
+            "score": max(long_s, short_s),
+            "side": None,
+            "reason": f"No clean side | LongScore {long_s}/100 | ShortScore {short_s}/100",
+            "reasons": [],
         }
 
-    if recent_bear_4h and recent_bear_1h and entry_flip == "SHORT" and below_ema and distance_from_ema50 <= MAX_DISTANCE_FROM_EMA50:
+    score = best_score["score"]
+    reasons = best_score["reasons"]
+    reason_text = build_reason_text(reasons)
+
+    if score >= ENTRY_SCORE:
         return {
-            "symbol": symbol,
-            "signal": "SHORT",
-            "reason": "Recent 4H+1H bearish SAR start, 15m bearish SAR flip, near EMA50",
-            "bars_15m": bars_15m,
-            "close_15m": close_15m,
-            "atr_15m": atr_15m,
+            **base,
+            "signal": best_side,
+            "side": best_side,
+            "score": score,
+            "reason": f"Ichimoku Smart Score {score}/100 | {reason_text}",
+            "reasons": reasons,
         }
 
-    # =========================
-    # EARLY ENTRY MODE + RSI FILTER
-    # =========================
-    if (
-        early_bull_4h
-        and early_bull_1h
-        and above_ema
-        and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50
-        and rsi_15m <= EARLY_LONG_MAX_RSI
-    ):
+    if score >= WATCH_SCORE:
         return {
-            "symbol": symbol,
-            "signal": "EARLY_LONG",
-            "reason": "Early bull trend detected on 4H+1H, waiting cleaner confirmation",
-            "bars_15m": bars_15m,
-            "close_15m": close_15m,
-            "atr_15m": atr_15m,
-        }
-
-    if (
-        early_bear_4h
-        and early_bear_1h
-        and below_ema
-        and distance_from_ema50 <= EARLY_MAX_DISTANCE_FROM_EMA50
-        and rsi_15m >= EARLY_SHORT_MIN_RSI
-    ):
-        return {
-            "symbol": symbol,
-            "signal": "EARLY_SHORT",
-            "reason": "Early bear trend detected on 4H+1H, waiting cleaner confirmation",
-            "bars_15m": bars_15m,
-            "close_15m": close_15m,
-            "atr_15m": atr_15m,
-        }
-
-    # =========================
-    # WAIT STATES
-    # =========================
-    if side_4h == "BULL" and side_1h == "BULL":
-        if not (recent_bull_4h and recent_bull_1h):
-            return {
-                "symbol": symbol,
-                "signal": "WAIT",
-                "reason": "Bull trend exists but not early enough on 4H/1H",
-            }
-        if distance_from_ema50 > MAX_DISTANCE_FROM_EMA50:
-            return {
-                "symbol": symbol,
-                "signal": "WAIT",
-                "reason": "Bull trend active but price is too far from EMA50",
-            }
-        return {
-            "symbol": symbol,
-            "signal": "WAIT",
-            "reason": "Early bull trend active, waiting 15m bullish SAR flip",
-        }
-
-    if side_4h == "BEAR" and side_1h == "BEAR":
-        if not (recent_bear_4h and recent_bear_1h):
-            return {
-                "symbol": symbol,
-                "signal": "WAIT",
-                "reason": "Bear trend exists but not early enough on 4H/1H",
-            }
-        if distance_from_ema50 > MAX_DISTANCE_FROM_EMA50:
-            return {
-                "symbol": symbol,
-                "signal": "WAIT",
-                "reason": "Bear trend active but price is too far from EMA50",
-            }
-        return {
-            "symbol": symbol,
-            "signal": "WAIT",
-            "reason": "Early bear trend active, waiting 15m bearish SAR flip",
+            **base,
+            "signal": "WATCH",
+            "side": best_side,
+            "score": score,
+            "reason": f"{best_side} setup قريب لكن ليس قوي كفاية | Score {score}/100 | {reason_text}",
+            "reasons": reasons,
         }
 
     return {
-        "symbol": symbol,
+        **base,
         "signal": "NO_TRADE",
-        "reason": "4H and 1H trend not aligned",
+        "side": best_side,
+        "score": score,
+        "reason": f"Weak setup | Score {score}/100",
+        "reasons": reasons,
     }
 
 
@@ -764,19 +901,33 @@ def calculate_trade_plan(
     entry = snapshot["close_15m"]
     atr_15m = snapshot["atr_15m"]
     bars_15m = snapshot["bars_15m"]
+    ichi_15m = snapshot["ichi_15m"]
+
+    if entry <= 0 or atr_15m <= 0:
+        return None
 
     if side == "LONG":
-        swing_stop = min([b[3] for b in bars_15m[-3:]])
-        atr_stop = entry - atr_15m * 1.2
-        stop_loss = min(swing_stop, atr_stop)
+        swing_stop = min([b[3] for b in bars_15m[-6:]])
+        cloud_stop = ichi_15m["cloud_bottom"]
+        atr_stop = entry - atr_15m * 1.4
+        stop_loss = min(swing_stop, atr_stop, cloud_stop)
         risk_per_unit = entry - stop_loss
+        tp1 = entry + risk_per_unit * TP1_R
+        tp2 = entry + risk_per_unit * TP2_R
     else:
-        swing_stop = max([b[2] for b in bars_15m[-3:]])
-        atr_stop = entry + atr_15m * 1.2
-        stop_loss = max(swing_stop, atr_stop)
+        swing_stop = max([b[2] for b in bars_15m[-6:]])
+        cloud_stop = ichi_15m["cloud_top"]
+        atr_stop = entry + atr_15m * 1.4
+        stop_loss = max(swing_stop, atr_stop, cloud_stop)
         risk_per_unit = stop_loss - entry
+        tp1 = entry - risk_per_unit * TP1_R
+        tp2 = entry - risk_per_unit * TP2_R
 
     if risk_per_unit <= 0:
+        return None
+
+    rr_to_tp2 = abs(tp2 - entry) / risk_per_unit
+    if rr_to_tp2 < MIN_RR:
         return None
 
     effective_risk = risk_per_trade * risk_multiplier
@@ -787,14 +938,6 @@ def calculate_trade_plan(
     if amount <= 0:
         return None
 
-    one_r = risk_per_unit
-    if side == "LONG":
-        tp1 = entry + one_r * TP1_R
-        tp2 = entry + one_r * TP2_R
-    else:
-        tp1 = entry - one_r * TP1_R
-        tp2 = entry - one_r * TP2_R
-
     return {
         "entry": normalize_price(symbol, entry),
         "stop_loss": normalize_price(symbol, stop_loss),
@@ -804,13 +947,45 @@ def calculate_trade_plan(
         "risk_amount": risk_amount,
         "risk_per_unit": risk_per_unit,
         "effective_risk": effective_risk,
+        "score": snapshot.get("score", 0),
+    }
+
+
+def get_exit_score(symbol: str, side: str) -> Optional[dict]:
+    snapshot = get_market_snapshot(symbol)
+    if not snapshot:
+        return None
+
+    opposite = "SHORT" if side == "LONG" else "LONG"
+    bars_4h = snapshot["bars_4h"]
+    bars_1h = snapshot["bars_1h"]
+    bars_15m = snapshot["bars_15m"]
+    ichi_4h = snapshot["ichi_4h"]
+    ichi_1h = snapshot["ichi_1h"]
+    ichi_15m = snapshot["ichi_15m"]
+    atr_15m = snapshot["atr_15m"]
+    rsi_15m = snapshot["rsi_15m"]
+
+    current_score = score_setup(
+        side, bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
+    )
+    opposite_score = score_setup(
+        opposite, bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
+    )
+
+    return {
+        "current_score": current_score["score"],
+        "opposite_score": opposite_score["score"],
+        "reason": build_reason_text(current_score["reasons"], limit=3),
+        "close": snapshot["close_15m"],
+        "atr_15m": atr_15m,
     }
 
 
 # =========================================================
 # 6) ORDERS / POSITION MANAGEMENT
 # =========================================================
-def open_position(symbol: str, side: str, plan: dict) -> bool:
+def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
     order_side = "buy" if side == "LONG" else "sell"
     try:
         set_leverage_and_margin(symbol, DEFAULT_LEVERAGE)
@@ -835,6 +1010,8 @@ def open_position(symbol: str, side: str, plan: dict) -> bool:
             "trailing_active": False,
             "trailing_stop": None,
             "opened_at": now_ts(),
+            "entry_score": snapshot.get("score", 0),
+            "entry_reason": snapshot.get("reason", ""),
         }
         return True
     except Exception as e:
@@ -941,27 +1118,36 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
 
         state = trade_state.get(symbol)
         if not state:
+            fallback_sl = entry_price * (0.985 if side == "LONG" else 1.015)
+            fallback_tp1 = entry_price * (1.009 if side == "LONG" else 0.991)
+            fallback_tp2 = entry_price * (1.018 if side == "LONG" else 0.982)
             trade_state[symbol] = {
                 "symbol": symbol,
                 "side": side,
                 "entry": entry_price,
-                "stop_loss": entry_price * (0.99 if side == "LONG" else 1.01),
-                "tp1": entry_price * (1.01 if side == "LONG" else 0.99),
-                "tp2": entry_price * (1.02 if side == "LONG" else 0.98),
+                "stop_loss": fallback_sl,
+                "tp1": fallback_tp1,
+                "tp2": fallback_tp2,
                 "tp1_taken": False,
                 "tp2_taken": False,
                 "trailing_active": False,
                 "trailing_stop": None,
                 "opened_at": now_ts(),
+                "entry_score": 0,
+                "entry_reason": "Recovered open position",
             }
             state = trade_state[symbol]
 
-        bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 120)
+        bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
         if not bars_15m:
             continue
         atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
         if atr_15m is None:
             continue
+
+        exit_info = get_exit_score(symbol, side)
+        current_score = exit_info["current_score"] if exit_info else 100
+        opposite_score = exit_info["opposite_score"] if exit_info else 0
 
         if side == "LONG":
             if mark_price <= state["stop_loss"]:
@@ -972,13 +1158,25 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     set_cooldown(symbol)
                 continue
 
+            if (
+                not state["tp1_taken"]
+                and current_score <= EMERGENCY_EXIT_SCORE
+                and opposite_score >= WATCH_SCORE
+            ):
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
             if (not state["tp1_taken"]) and mark_price >= state["tp1"]:
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
                     await notify(
                         context,
-                        f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven"
+                        f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
                     )
                     continue
 
@@ -990,9 +1188,18 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["trailing_stop"] = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
                     await notify(
                         context,
-                        f"🚀 TP2 LONG\n{symbol}\nTrailing stop activated"
+                        f"🚀 TP2 LONG\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
                     )
                     continue
+
+            if state["tp1_taken"] and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+                refreshed = get_symbol_position(symbol) or pos
+                if close_position(symbol, refreshed, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
 
             if state["trailing_active"]:
                 new_trailing = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
@@ -1019,13 +1226,25 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     set_cooldown(symbol)
                 continue
 
+            if (
+                not state["tp1_taken"]
+                and current_score <= EMERGENCY_EXIT_SCORE
+                and opposite_score >= WATCH_SCORE
+            ):
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
             if (not state["tp1_taken"]) and mark_price <= state["tp1"]:
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
                     await notify(
                         context,
-                        f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven"
+                        f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
                     )
                     continue
 
@@ -1037,9 +1256,18 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["trailing_stop"] = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
                     await notify(
                         context,
-                        f"🚀 TP2 SHORT\n{symbol}\nTrailing stop activated"
+                        f"🚀 TP2 SHORT\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
                     )
                     continue
+
+            if state["tp1_taken"] and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+                refreshed = get_symbol_position(symbol) or pos
+                if close_position(symbol, refreshed, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
 
             if state["trailing_active"]:
                 new_trailing = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
@@ -1096,46 +1324,34 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
 
             signal = snapshot["signal"]
             reason = snapshot["reason"]
+            score = snapshot.get("score", 0)
 
-            scan_lines.append(f"{symbol}: {signal} | {reason}")
-            last_signal_summary = f"{symbol}: {signal} | {reason}"
+            scan_lines.append(f"{symbol}: {signal} | Score {score}/100 | {reason}")
+            last_signal_summary = f"{symbol}: {signal} | Score {score}/100 | {reason}"
 
-            entry_side = None
-            risk_multiplier = 1.0
-
-            if signal == "LONG":
-                entry_side = "LONG"
-                risk_multiplier = 1.0
-            elif signal == "SHORT":
-                entry_side = "SHORT"
-                risk_multiplier = 1.0
-            elif signal == "EARLY_LONG":
-                entry_side = "LONG"
-                risk_multiplier = 0.5
-            elif signal == "EARLY_SHORT":
-                entry_side = "SHORT"
-                risk_multiplier = 0.5
-            else:
+            if signal not in ("LONG", "SHORT"):
                 continue
+
+            entry_side = signal
 
             balance = fetch_balance_usdt()
             if balance <= 5:
                 scan_lines.append(f"{symbol}: LOW_BALANCE")
                 continue
 
-            plan = calculate_trade_plan(symbol, snapshot, entry_side, balance, risk_multiplier=risk_multiplier)
+            plan = calculate_trade_plan(symbol, snapshot, entry_side, balance, risk_multiplier=1.0)
             if not plan:
                 scan_lines.append(f"{symbol}: PLAN_REJECTED")
                 continue
 
-            if open_position(symbol, entry_side, plan):
+            if open_position(symbol, entry_side, plan, snapshot):
                 await notify(
                     context,
                     (
-                        f"🚀 Trade Opened\n"
+                        f"🚀 Ichimoku Smart Trade Opened\n"
                         f"Symbol: {symbol}\n"
-                        f"Side: {signal}\n"
-                        f"Execution Side: {entry_side}\n"
+                        f"Side: {entry_side}\n"
+                        f"SmartScore: {score}/100\n"
                         f"Reason: {reason}\n"
                         f"Entry: {format_num(plan['entry'], 6)}\n"
                         f"SL: {format_num(plan['stop_loss'], 6)}\n"
@@ -1145,7 +1361,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                         f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%"
                     )
                 )
-                scan_lines.append(f"{symbol}: OPENED {signal}")
+                scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
                 if count_open_positions() >= MAX_OPEN_POSITIONS:
                     break
             else:
@@ -1217,11 +1433,17 @@ async def show_positions(message_target, positions: List[dict]):
         contracts = safe_float(p.get("contracts", 0))
         if contracts == 0:
             continue
+        symbol = p["symbol"]
+        state = trade_state.get(symbol, {})
+        extra = ""
+        if state:
+            extra = f" | Score: {state.get('entry_score', '-')}"
         lines.append(
-            f"{p['symbol']} | {p.get('side')} | "
+            f"{symbol} | {p.get('side')} | "
             f"Entry: {format_num(safe_float(p.get('entryPrice', 0)), 6)} | "
             f"Mark: {format_num(safe_float(p.get('markPrice', 0)), 6)} | "
             f"UPnL: {format_num(safe_float(p.get('unrealizedPnl', 0)), 4)}"
+            f"{extra}"
         )
     if not lines:
         await message_target.reply_text("لا توجد صفقات مفتوحة.")
@@ -1272,7 +1494,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         context.bot_data["chat_id"] = str(update.effective_chat.id)
     await update.message.reply_text(
-        "🤖 SAR Multi-Timeframe Bot جاهز.\nاستخدم لوحة التحكم:",
+        "🤖 Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:",
         reply_markup=dashboard_kb()
     )
 
@@ -1282,10 +1504,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = fetch_balance_usdt()
     await update.message.reply_text(
         f"📊 الحالة\n"
+        f"الاستراتيجية: Ichimoku Smart Score\n"
         f"متوقف: {paused}\n"
         f"الرصيد: {bal:.2f} USDT\n"
         f"الصفقات المفتوحة: {count_open_positions()}/{MAX_OPEN_POSITIONS}\n"
         f"المخاطرة الحالية: {risk_per_trade * 100:.2f}%\n"
+        f"نقطة الدخول: {ENTRY_SCORE}/100\n"
         f"آخر إشارة: {last_signal_summary}\n\n"
         f"آخر فحص:\n{last_scan_summary}",
         reply_markup=dashboard_kb()
@@ -1416,7 +1640,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"SAR_MULTI_TIMEFRAME_BOT_LIVE")
+        self.wfile.write(b"ICHIMOKU_SMART_BOT_LIVE")
 
 
 # =========================================================
@@ -1460,7 +1684,7 @@ def main():
     app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
     app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
 
-    logger.info("Starting SAR Multi-Timeframe Bot...")
+    logger.info("Starting Ichimoku Smart Bot...")
     app.run_polling(drop_pending_updates=True)
 
 
