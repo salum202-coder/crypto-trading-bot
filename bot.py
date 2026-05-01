@@ -34,7 +34,13 @@ if not BINGX_API_KEY or not BINGX_SECRET:
 
 # BingX Perpetual USDT-M
 MARGIN_MODE = "isolated"
-DEFAULT_LEVERAGE = 3
+
+# Mode system
+BOT_MODE = "NORMAL"  # NORMAL / AGGRESSIVE
+
+NORMAL_LEVERAGE = 3
+AGGRESSIVE_LEVERAGE = 5
+DEFAULT_LEVERAGE = NORMAL_LEVERAGE
 
 SYMBOLS = [
     "BTC/USDT:USDT",
@@ -988,8 +994,8 @@ def get_exit_score(symbol: str, side: str) -> Optional[dict]:
 def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
     order_side = "buy" if side == "LONG" else "sell"
     try:
-        set_leverage_and_margin(symbol, DEFAULT_LEVERAGE)
-
+leverage = AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+set_leverage_and_margin(symbol, leverage)
         order = exchange.create_market_order(
             symbol,
             order_side,
@@ -1358,7 +1364,9 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                         f"TP1: {format_num(plan['tp1'], 6)}\n"
                         f"TP2: {format_num(plan['tp2'], 6)}\n"
                         f"Amount: {plan['amount']}\n"
-                        f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%"
+                        f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%\n"
+f"Mode: {BOT_MODE}\n"
+f"Leverage: {AGGRESSIVE_LEVERAGE if BOT_MODE == 'AGGRESSIVE' else NORMAL_LEVERAGE}x"
                     )
                 )
                 scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
@@ -1407,6 +1415,10 @@ def dashboard_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❌ إغلاق الخاسرة", callback_data="dash_close_losers"),
         ],
+        [
+    InlineKeyboardButton("🔥 Aggressive", callback_data="mode_aggressive"),
+    InlineKeyboardButton("🧠 Normal", callback_data="mode_normal"),
+],
     ])
 
 
@@ -1568,7 +1580,15 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_paused, risk_per_trade
+global BOT_MODE
 
+elif data == "mode_aggressive":
+    BOT_MODE = "AGGRESSIVE"
+    await query.message.reply_text("🔥 تم تفعيل Aggressive Mode")
+
+elif data == "mode_normal":
+    BOT_MODE = "NORMAL"
+    await query.message.reply_text("🧠 تم تفعيل Normal Mode")
     query = update.callback_query
     await query.answer()
     data = query.data
