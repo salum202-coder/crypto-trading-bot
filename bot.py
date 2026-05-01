@@ -36,7 +36,11 @@ if not BINGX_API_KEY or not BINGX_SECRET:
 MARGIN_MODE = "isolated"
 
 # Mode system
-BOT_MODE = "NORMAL"  # NORMAL / AGGRESSIVE
+# NORMAL = current safer mode with 3x leverage
+# AGGRESSIVE = higher leverage mode with 5x leverage only
+BOT_MODE = os.getenv("BOT_MODE", "NORMAL").upper()
+if BOT_MODE not in ("NORMAL", "AGGRESSIVE"):
+    BOT_MODE = "NORMAL"
 
 NORMAL_LEVERAGE = 3
 AGGRESSIVE_LEVERAGE = 5
@@ -153,6 +157,14 @@ def format_num(v: float, digits: int = 6) -> str:
         return f"{float(v):.{digits}f}"
     except Exception:
         return str(v)
+
+
+def get_current_leverage() -> int:
+    return AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+
+
+def get_mode_text() -> str:
+    return f"{BOT_MODE} ({get_current_leverage()}x)"
 
 
 def get_active_chat_id(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[str]:
@@ -994,7 +1006,7 @@ def get_exit_score(symbol: str, side: str) -> Optional[dict]:
 def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
     order_side = "buy" if side == "LONG" else "sell"
     try:
-        leverage = AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+        leverage = get_current_leverage()
         set_leverage_and_margin(symbol, leverage)
 
         order = exchange.create_market_order(
@@ -1019,6 +1031,8 @@ def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
             "opened_at": now_ts(),
             "entry_score": snapshot.get("score", 0),
             "entry_reason": snapshot.get("reason", ""),
+            "mode": BOT_MODE,
+            "leverage": leverage,
         }
         return True
     except Exception as e:
@@ -1366,8 +1380,8 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                         f"TP2: {format_num(plan['tp2'], 6)}\n"
                         f"Amount: {plan['amount']}\n"
                         f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%\n"
-f"Mode: {BOT_MODE}\n"
-f"Leverage: {AGGRESSIVE_LEVERAGE if BOT_MODE == 'AGGRESSIVE' else NORMAL_LEVERAGE}x"
+                        f"Mode: {BOT_MODE}\n"
+                        f"Leverage: {get_current_leverage()}x"
                     )
                 )
                 scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
@@ -1394,6 +1408,10 @@ def dashboard_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📡 الرادار", callback_data="dash_radar"),
         ],
         [
+            InlineKeyboardButton("🧠 Normal 3x", callback_data="mode_normal"),
+            InlineKeyboardButton("🔥 Aggressive 5x", callback_data="mode_aggressive"),
+        ],
+        [
             InlineKeyboardButton("📂 الصفقات", callback_data="dash_positions"),
             InlineKeyboardButton("📈 اليوم", callback_data="dash_stats"),
         ],
@@ -1416,10 +1434,6 @@ def dashboard_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("❌ إغلاق الخاسرة", callback_data="dash_close_losers"),
         ],
-        [
-    InlineKeyboardButton("🔥 Aggressive", callback_data="mode_aggressive"),
-    InlineKeyboardButton("🧠 Normal", callback_data="mode_normal"),
-],
     ])
 
 
@@ -1450,7 +1464,7 @@ async def show_positions(message_target, positions: List[dict]):
         state = trade_state.get(symbol, {})
         extra = ""
         if state:
-            extra = f" | Score: {state.get('entry_score', '-')}"
+            extra = f" | Score: {state.get('entry_score', '-')} | Mode: {state.get('mode', BOT_MODE)} | Lev: {state.get('leverage', get_current_leverage())}x"
         lines.append(
             f"{symbol} | {p.get('side')} | "
             f"Entry: {format_num(safe_float(p.get('entryPrice', 0)), 6)} | "
@@ -1517,6 +1531,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = fetch_balance_usdt()
     await update.message.reply_text(
         f"📊 الحالة\n"
+        f"الوضع: {get_mode_text()}\n"
         f"الاستراتيجية: Ichimoku Smart Score\n"
         f"متوقف: {paused}\n"
         f"الرصيد: {bal:.2f} USDT\n"
@@ -1580,9 +1595,7 @@ async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 10) CALLBACKS
 # =========================================================
 async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_paused, risk_per_trade
-global BOT_MODE
-
+    global bot_paused, risk_per_trade, BOT_MODE
 
     query = update.callback_query
     await query.answer()
@@ -1591,16 +1604,18 @@ global BOT_MODE
     if data == "dash_home":
         await query.message.reply_text("🎛 لوحة التحكم:", reply_markup=dashboard_kb())
 
+    elif data == "mode_normal":
+        BOT_MODE = "NORMAL"
+        await query.message.reply_text("🧠 تم تفعيل الوضع العادي NORMAL (3x)")
+
+    elif data == "mode_aggressive":
+        BOT_MODE = "AGGRESSIVE"
+        await query.message.reply_text("🔥 تم تفعيل الوضع الهجومي AGGRESSIVE (5x)")
+
     elif data == "dash_balance":
         bal = fetch_balance_usdt()
         await query.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
-elif data == "mode_normal":
-    BOT_MODE = "NORMAL"
-    await query.message.reply_text("🧠 Mode: NORMAL (3x)")
 
-elif data == "mode_aggressive":
-    BOT_MODE = "AGGRESSIVE"
-    await query.message.reply_text("🔥 Mode: AGGRESSIVE (5x)")
     elif data == "dash_radar":
         await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
 
