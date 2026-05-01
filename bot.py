@@ -994,13 +994,15 @@ def get_exit_score(symbol: str, side: str) -> Optional[dict]:
 def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
     order_side = "buy" if side == "LONG" else "sell"
     try:
-leverage = AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
-set_leverage_and_margin(symbol, leverage)
+        leverage = AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+        set_leverage_and_margin(symbol, leverage)
+
         order = exchange.create_market_order(
             symbol,
             order_side,
             plan["amount"],
             params=get_order_params(reduce_only=False),
+        )
         )
         logger.info(f"{symbol}: opened {side} -> {order.get('id')}")
 
