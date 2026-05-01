@@ -1003,7 +1003,6 @@ def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
             plan["amount"],
             params=get_order_params(reduce_only=False),
         )
-        )
         logger.info(f"{symbol}: opened {side} -> {order.get('id')}")
 
         trade_state[symbol] = {
