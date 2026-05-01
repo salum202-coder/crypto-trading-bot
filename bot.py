@@ -1583,13 +1583,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_paused, risk_per_trade
 global BOT_MODE
 
-elif data == "mode_aggressive":
-    BOT_MODE = "AGGRESSIVE"
-    await query.message.reply_text("🔥 تم تفعيل Aggressive Mode")
 
-elif data == "mode_normal":
-    BOT_MODE = "NORMAL"
-    await query.message.reply_text("🧠 تم تفعيل Normal Mode")
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1600,7 +1594,13 @@ elif data == "mode_normal":
     elif data == "dash_balance":
         bal = fetch_balance_usdt()
         await query.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
+elif data == "mode_normal":
+    BOT_MODE = "NORMAL"
+    await query.message.reply_text("🧠 Mode: NORMAL (3x)")
 
+elif data == "mode_aggressive":
+    BOT_MODE = "AGGRESSIVE"
+    await query.message.reply_text("🔥 Mode: AGGRESSIVE (5x)")
     elif data == "dash_radar":
         await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
 
