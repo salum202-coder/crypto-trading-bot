@@ -35,6 +35,7 @@ if TRADING_MODE not in ("PAPER", "LIVE"):
     TRADING_MODE = "PAPER"
 
 PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "100"))
+FORCE_RESET_PAPER = os.getenv("FORCE_RESET_PAPER", "false").lower() in ("1", "true", "yes")
 PAPER_FILE = Path("paper_binance.json")
 paper_balance = PAPER_START_BALANCE
 
@@ -91,8 +92,13 @@ TF_15M = "15m"
 MAX_OPEN_POSITIONS = 2
 COOLDOWN_MINUTES = 60
 
-# Risk can be changed from Telegram
-risk_per_trade = 0.005  # 0.5%
+# Risk can be changed from Telegram / Smart Risk Manager
+BASE_RISK_PER_TRADE = 0.005      # 0.5%
+BOOST_RISK_PER_TRADE = 0.0075    # 0.75% after 2 consecutive wins
+risk_per_trade = BASE_RISK_PER_TRADE
+consecutive_wins = 0
+consecutive_losses = 0
+traded_symbols_today: Dict[str, str] = {}
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -616,6 +622,12 @@ def save_stats_to_disk() -> None:
         payload = {
             "daily_stats": daily_stats,
             "all_stats": all_stats,
+            "risk_manager": {
+                "risk_per_trade": risk_per_trade,
+                "consecutive_wins": consecutive_wins,
+                "consecutive_losses": consecutive_losses,
+                "traded_symbols_today": traded_symbols_today,
+            },
         }
         STATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
@@ -623,7 +635,7 @@ def save_stats_to_disk() -> None:
 
 
 def load_stats_from_disk() -> None:
-    global daily_stats, all_stats
+    global daily_stats, all_stats, risk_per_trade, consecutive_wins, consecutive_losses, traded_symbols_today
 
     if not STATS_FILE.exists():
         daily_stats = empty_daily_stats()
@@ -635,6 +647,11 @@ def load_stats_from_disk() -> None:
         raw = json.loads(STATS_FILE.read_text(encoding="utf-8"))
         daily_stats = raw.get("daily_stats") or empty_daily_stats()
         all_stats = raw.get("all_stats") or empty_all_stats()
+        rm = raw.get("risk_manager") or {}
+        risk_per_trade = safe_float(rm.get("risk_per_trade", BASE_RISK_PER_TRADE), BASE_RISK_PER_TRADE)
+        consecutive_wins = int(safe_float(rm.get("consecutive_wins", 0), 0))
+        consecutive_losses = int(safe_float(rm.get("consecutive_losses", 0), 0))
+        traded_symbols_today = rm.get("traded_symbols_today", {}) or {}
     except Exception as e:
         logger.error(f"load_stats_from_disk error: {e}")
         daily_stats = empty_daily_stats()
@@ -660,11 +677,63 @@ def load_stats_from_disk() -> None:
 
 
 def reset_daily_stats_if_needed() -> None:
-    global daily_stats
+    global daily_stats, traded_symbols_today
     today = utc_today()
     if daily_stats.get("date") != today:
         daily_stats = empty_daily_stats()
+        traded_symbols_today = {}
         save_stats_to_disk()
+
+
+def can_trade_symbol_today(symbol: str) -> bool:
+    reset_daily_stats_if_needed()
+    return traded_symbols_today.get(symbol) != utc_today()
+
+
+def mark_symbol_traded_today(symbol: str) -> None:
+    traded_symbols_today[symbol] = utc_today()
+    save_stats_to_disk()
+
+
+def apply_smart_risk_after_close(pnl_pct: float) -> None:
+    """
+    Smart Risk Manager:
+    - After 2 consecutive wins: risk becomes 0.75%
+    - After any loss: risk returns to 0.5%
+    - No 6-hour pause
+    - No daily loss stop
+    - No max trades/day rule
+    """
+    global risk_per_trade, consecutive_wins, consecutive_losses
+
+    if pnl_pct >= 0:
+        consecutive_wins += 1
+        consecutive_losses = 0
+        if consecutive_wins >= 2:
+            risk_per_trade = BOOST_RISK_PER_TRADE
+    else:
+        consecutive_losses += 1
+        consecutive_wins = 0
+        risk_per_trade = BASE_RISK_PER_TRADE
+
+    save_stats_to_disk()
+
+
+def build_risk_manager_text() -> str:
+    return (
+        f"🧠 Smart Risk Manager\\n"
+        f"Current Risk: {risk_per_trade * 100:.2f}%\\n"
+        f"Base Risk: {BASE_RISK_PER_TRADE * 100:.2f}%\\n"
+        f"Boost Risk: {BOOST_RISK_PER_TRADE * 100:.2f}%\\n"
+        f"Consecutive Wins: {consecutive_wins}\\n"
+        f"Consecutive Losses: {consecutive_losses}\\n"
+        f"Rule: بعد ربحين متتاليين يرفع المخاطرة إلى 0.75%\\n"
+        f"Rule: بعد أي خسارة يرجع المخاطرة إلى 0.50%\\n"
+        f"Same Symbol Today: ممنوع تكرار نفس العملة في نفس اليوم\\n"
+        f"Daily Stop: غير مفعّل\\n"
+        f"6h Pause: غير مفعّل\\n"
+        f"Max Daily Trades: غير مفعّل"
+    )
 
 
 def update_symbol_stats(symbol: str, pnl_pct: float) -> None:
@@ -775,6 +844,13 @@ def save_paper_to_disk() -> None:
 def load_paper_from_disk() -> None:
     global paper_balance, trade_state
     if TRADING_MODE != "PAPER":
+        return
+
+    if FORCE_RESET_PAPER:
+        paper_balance = PAPER_START_BALANCE
+        trade_state = {}
+        save_paper_to_disk()
+        logger.info(f"[PAPER] Force reset enabled. Balance reset to {paper_balance:.2f}")
         return
 
     if not PAPER_FILE.exists():
@@ -1277,6 +1353,7 @@ def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side
         all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
 
     update_symbol_stats(symbol, pnl_pct)
+    apply_smart_risk_after_close(pnl_pct)
     save_stats_to_disk()
 
 
@@ -1552,6 +1629,10 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                 scan_lines.append(f"{symbol}: ALREADY_OPEN")
                 continue
 
+            if not can_trade_symbol_today(symbol):
+                scan_lines.append(f"{symbol}: SKIP | already traded today")
+                continue
+
             snapshot = get_market_snapshot(symbol)
             if not snapshot:
                 scan_lines.append(f"{symbol}: NO_DATA")
@@ -1600,6 +1681,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                         f"Balance: {fetch_balance_usdt():.2f} USDT"
                     )
                 )
+                mark_symbol_traded_today(symbol)
                 scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
                 if count_open_positions() >= MAX_OPEN_POSITIONS:
                     break
@@ -1766,6 +1848,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الرصيد: {bal:.2f} USDT\n"
         f"الصفقات المفتوحة: {count_open_positions()}/{MAX_OPEN_POSITIONS}\n"
         f"المخاطرة الحالية: {risk_per_trade * 100:.2f}%\n"
+        f"Smart Wins/Losses: {consecutive_wins}/{consecutive_losses}\n"
         f"نقطة الدخول: {ENTRY_SCORE}/100\n"
         f"آخر إشارة: {last_signal_summary}\n\n"
         f"آخر فحص:\n{last_scan_summary}",
@@ -1817,6 +1900,10 @@ async def cmd_allstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_best_symbols_text())
+
+
+async def cmd_riskmanager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_risk_manager_text())
 
 
 async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1881,7 +1968,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "dash_risk_menu":
         await query.message.reply_text(
-            f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%",
+            f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%\n\n{build_risk_manager_text()}",
             reply_markup=risk_kb()
         )
 
@@ -1922,7 +2009,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 # 12) MAIN
 # =========================================================
 def main():
+    global risk_per_trade, consecutive_wins, consecutive_losses, traded_symbols_today
     load_stats_from_disk()
+    if FORCE_RESET_PAPER:
+        risk_per_trade = BASE_RISK_PER_TRADE
+        consecutive_wins = 0
+        consecutive_losses = 0
+        traded_symbols_today = {}
+        save_stats_to_disk()
     load_paper_from_disk()
 
     threading.Thread(
@@ -1954,6 +2048,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("allstats", cmd_allstats))
     app.add_handler(CommandHandler("best", cmd_best))
+    app.add_handler(CommandHandler("riskmanager", cmd_riskmanager))
     app.add_handler(CommandHandler("closeall", cmd_close_all))
     app.add_handler(CallbackQueryHandler(dashboard_handler))
 
