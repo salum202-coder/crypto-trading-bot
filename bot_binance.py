@@ -34,7 +34,7 @@ TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
 if TRADING_MODE not in ("PAPER", "LIVE"):
     TRADING_MODE = "PAPER"
 
-PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "100"))
 PAPER_FILE = Path("paper_binance.json")
 paper_balance = PAPER_START_BALANCE
 
