@@ -28,10 +28,23 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() in ("1", "true", "yes")
 PORT = int(os.environ.get("PORT", "8080"))
 
+# PAPER = تداول وهمي بدون أوامر حقيقية
+# LIVE  = تداول حقيقي على Binance
+TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
+if TRADING_MODE not in ("PAPER", "LIVE"):
+    TRADING_MODE = "PAPER"
+
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
+PAPER_FILE = Path("paper_binance.json")
+paper_balance = PAPER_START_BALANCE
+
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
-if not BINANCE_API_KEY or not BINANCE_SECRET:
-    raise RuntimeError("Missing BINANCE_API_KEY or BINANCE_SECRET")
+
+# في وضع PAPER نحتاج API فقط لجلب الأسعار، لكن لا نحتاج مفاتيح للتداول الحقيقي
+if TRADING_MODE == "LIVE":
+    if not BINANCE_API_KEY or not BINANCE_SECRET:
+        raise RuntimeError("Missing BINANCE_API_KEY or BINANCE_SECRET")
 
 # Binance USDT-M Futures
 MARGIN_MODE = "isolated"
@@ -114,15 +127,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ICHIMOKU_SMART_BINANCE_BOT")
 
-exchange = ccxt.binanceusdm({
-    "apiKey": BINANCE_API_KEY,
-    "secret": BINANCE_SECRET,
+exchange_config = {
     "enableRateLimit": True,
     "options": {
         "defaultType": "future",
         "adjustForTimeDifference": True,
     },
-})
+}
+if BINANCE_API_KEY and BINANCE_SECRET:
+    exchange_config["apiKey"] = BINANCE_API_KEY
+    exchange_config["secret"] = BINANCE_SECRET
+
+exchange = ccxt.binanceusdm(exchange_config)
 
 if BINANCE_TESTNET:
     exchange.set_sandbox_mode(True)
@@ -170,6 +186,10 @@ def get_current_leverage() -> int:
 
 def get_mode_text() -> str:
     return f"{BOT_MODE} ({get_current_leverage()}x)"
+
+
+def get_trade_mode_text() -> str:
+    return "PAPER وهمي" if TRADING_MODE == "PAPER" else "LIVE حقيقي"
 
 
 def get_active_chat_id(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[str]:
@@ -291,10 +311,6 @@ def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> 
 
 
 def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
-    """
-    Practical Ichimoku snapshot for bot decisions.
-    For current cloud, we compare price with the cloud values projected from 26 candles ago.
-    """
     required = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 5
     if len(ohlcv) < required:
         return None
@@ -317,7 +333,6 @@ def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
     cloud_bottom = min(span_a_current, span_b_current)
     close = ohlcv[-1][4]
 
-    # Future cloud from current candle.
     span_a_future = (tenkan_now + kijun_now) / 2
     span_b_future = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, last)
     if span_b_future is None:
@@ -420,7 +435,6 @@ def score_setup(
     want = "BULL" if side == "LONG" else "BEAR"
     cloud_side = "ABOVE" if side == "LONG" else "BELOW"
 
-    # 4H macro direction
     if trend_4h == want:
         score += 25
         reasons.append(f"4H {want} فوق/تحت السحابة بشكل واضح")
@@ -434,7 +448,6 @@ def score_setup(
         score -= 35
         reasons.append("4H ضد اتجاه الصفقة")
 
-    # 1H confirmation
     if trend_1h == want:
         score += 20
         reasons.append(f"1H يؤكد الاتجاه {want}")
@@ -448,7 +461,6 @@ def score_setup(
         score -= 25
         reasons.append("1H ضد الصفقة")
 
-    # 15m entry condition
     if trend_15m == want:
         score += 15
         reasons.append("15m متوافق للدخول")
@@ -459,7 +471,6 @@ def score_setup(
         score -= 12
         reasons.append("15m غير مناسب للدخول")
 
-    # Pullback quality around Kijun
     distance_kijun = abs(close_15m - ichi_15m["kijun"]) / ichi_15m["kijun"] if ichi_15m["kijun"] > 0 else 999
     if distance_kijun <= MAX_DISTANCE_FROM_KIJUN_15M:
         score += 12
@@ -468,7 +479,6 @@ def score_setup(
         score -= 10
         reasons.append("السعر بعيد عن Kijun، احتمال الدخول متأخر")
 
-    # Momentum by Tenkan/Kijun and future cloud
     if ichi_1h["future_cloud_bias"] == want and ichi_15m["tk_bias"] == want:
         score += 10
         reasons.append("زخم Ichimoku داعم")
@@ -476,7 +486,6 @@ def score_setup(
         score += 5
         reasons.append("زخم 15m داعم جزئيًا")
 
-    # Candle strength
     if candle["direction"] == want and candle["body_ratio"] >= 0.45:
         score += 8
         reasons.append("شمعة الدخول قوية")
@@ -484,7 +493,6 @@ def score_setup(
         score -= 8
         reasons.append("شمعة الدخول عكس الاتجاه")
 
-    # Structure
     if structure_15m == want:
         score += 6
         reasons.append("هيكل 15m داعم")
@@ -492,7 +500,6 @@ def score_setup(
         score -= 4
         reasons.append("هيكل 15m عرضي")
 
-    # Volume
     if vol_ok:
         score += 5
         reasons.append(f"الحجم جيد ({vol_ratio:.2f}x)")
@@ -500,7 +507,6 @@ def score_setup(
         score -= 3
         reasons.append(f"الحجم ضعيف ({vol_ratio:.2f}x)")
 
-    # Volatility filter
     if MIN_ATR_PERCENT_15M <= atr_pct <= MAX_ATR_PERCENT_15M:
         score += 4
         reasons.append("التذبذب مناسب")
@@ -511,7 +517,6 @@ def score_setup(
         score -= 10
         reasons.append("السوق بارد جدًا")
 
-    # RSI sanity
     if side == "LONG":
         if 42 <= rsi_15m <= 68:
             score += 5
@@ -681,7 +686,8 @@ def build_today_stats_text() -> str:
         f"الرابحة: {daily_stats['wins']}\n"
         f"الخاسرة: {daily_stats['losses']}\n"
         f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%"
+        f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%\n"
+        f"وضع التداول: {get_trade_mode_text()}"
     )
 
 
@@ -706,7 +712,8 @@ def build_all_stats_text() -> str:
         f"نسبة النجاح: {win_rate:.2f}%\n"
         f"إجمالي PnL%: {pnl:.2f}%\n"
         f"أفضل صفقة: {best_win:.2f}%\n"
-        f"أسوأ صفقة: {worst_loss:.2f}%"
+        f"أسوأ صفقة: {worst_loss:.2f}%\n"
+        f"وضع التداول: {get_trade_mode_text()}"
     )
 
 
@@ -735,9 +742,55 @@ def build_best_symbols_text(limit: int = 5) -> str:
 
 
 # =========================================================
+# 3.3) PAPER TRADING PERSISTENCE
+# =========================================================
+def save_paper_to_disk() -> None:
+    try:
+        payload = {
+            "paper_balance": paper_balance,
+            "trade_state": trade_state,
+        }
+        PAPER_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save_paper_to_disk error: {e}")
+
+
+def load_paper_from_disk() -> None:
+    global paper_balance, trade_state
+    if TRADING_MODE != "PAPER":
+        return
+
+    if not PAPER_FILE.exists():
+        paper_balance = PAPER_START_BALANCE
+        save_paper_to_disk()
+        return
+
+    try:
+        raw = json.loads(PAPER_FILE.read_text(encoding="utf-8"))
+        paper_balance = safe_float(raw.get("paper_balance", PAPER_START_BALANCE), PAPER_START_BALANCE)
+        trade_state = raw.get("trade_state", {}) or {}
+    except Exception as e:
+        logger.error(f"load_paper_from_disk error: {e}")
+        paper_balance = PAPER_START_BALANCE
+        trade_state = {}
+        save_paper_to_disk()
+
+
+def paper_mark_price(symbol: str, fallback: float = 0.0) -> float:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        return safe_float(ticker.get("last") or ticker.get("mark") or ticker.get("close"), fallback)
+    except Exception:
+        return fallback
+
+
+# =========================================================
 # 4) EXCHANGE WRAPPERS
 # =========================================================
 def fetch_balance_usdt() -> float:
+    if TRADING_MODE == "PAPER":
+        return paper_balance
+
     try:
         bal = exchange.fetch_balance({"type": "future"})
         if isinstance(bal.get("USDT"), dict):
@@ -751,6 +804,34 @@ def fetch_balance_usdt() -> float:
 
 
 def fetch_positions() -> List[dict]:
+    if TRADING_MODE == "PAPER":
+        positions = []
+        for symbol, state in trade_state.items():
+            if state.get("status") != "open":
+                continue
+
+            entry = safe_float(state.get("entry", 0))
+            amount = safe_float(state.get("remaining_amount", state.get("amount", 0)))
+            side = state.get("side", "LONG")
+            mark = paper_mark_price(symbol, entry)
+
+            if side == "LONG":
+                upnl = (mark - entry) * amount
+                side_raw = "long"
+            else:
+                upnl = (entry - mark) * amount
+                side_raw = "short"
+
+            positions.append({
+                "symbol": symbol,
+                "side": side_raw,
+                "contracts": amount,
+                "entryPrice": entry,
+                "markPrice": mark,
+                "unrealizedPnl": upnl,
+            })
+        return positions
+
     try:
         return exchange.fetch_positions(params={"type": "future"})
     except Exception as e:
@@ -759,6 +840,12 @@ def fetch_positions() -> List[dict]:
 
 
 def get_symbol_position(symbol: str) -> Optional[dict]:
+    if TRADING_MODE == "PAPER":
+        for p in fetch_positions():
+            if p.get("symbol") == symbol and safe_float(p.get("contracts", 0)) != 0:
+                return p
+        return None
+
     try:
         positions = exchange.fetch_positions([symbol], params={"type": "future"})
         for p in positions:
@@ -787,6 +874,9 @@ def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> Optional[List[L
 
 
 def set_leverage_and_margin(symbol: str, leverage: int) -> None:
+    if TRADING_MODE == "PAPER":
+        return
+
     try:
         exchange.set_position_mode(False)
     except Exception as e:
@@ -1009,6 +1099,33 @@ def get_exit_score(symbol: str, side: str) -> Optional[dict]:
 # 6) ORDERS / POSITION MANAGEMENT
 # =========================================================
 def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
+    if TRADING_MODE == "PAPER":
+        leverage = get_current_leverage()
+        trade_state[symbol] = {
+            "symbol": symbol,
+            "side": side,
+            "entry": plan["entry"],
+            "stop_loss": plan["stop_loss"],
+            "tp1": plan["tp1"],
+            "tp2": plan["tp2"],
+            "amount": plan["amount"],
+            "remaining_amount": plan["amount"],
+            "tp1_taken": False,
+            "tp2_taken": False,
+            "trailing_active": False,
+            "trailing_stop": None,
+            "opened_at": now_ts(),
+            "entry_score": snapshot.get("score", 0),
+            "entry_reason": snapshot.get("reason", ""),
+            "mode": BOT_MODE,
+            "leverage": leverage,
+            "status": "open",
+            "paper": True,
+        }
+        save_paper_to_disk()
+        logger.info(f"[PAPER] {symbol}: opened {side}")
+        return True
+
     order_side = "buy" if side == "LONG" else "sell"
     try:
         leverage = get_current_leverage()
@@ -1046,6 +1163,37 @@ def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
 
 
 def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
+    global paper_balance
+
+    if TRADING_MODE == "PAPER":
+        state = trade_state.get(symbol)
+        if not state or state.get("status") != "open":
+            return False
+
+        entry = safe_float(state.get("entry", 0))
+        mark = safe_float(position.get("markPrice", paper_mark_price(symbol, entry)))
+        remaining = safe_float(state.get("remaining_amount", state.get("amount", 0)))
+        amount_to_close = remaining * portion
+
+        if amount_to_close <= 0:
+            return False
+
+        side = state.get("side", "LONG")
+        if side == "LONG":
+            pnl = (mark - entry) * amount_to_close
+        else:
+            pnl = (entry - mark) * amount_to_close
+
+        paper_balance += pnl
+        state["remaining_amount"] = max(0.0, remaining - amount_to_close)
+
+        if state["remaining_amount"] <= 0.00000001 or portion >= 0.999:
+            state["status"] = "closed"
+
+        save_paper_to_disk()
+        logger.info(f"[PAPER] {symbol}: closed {amount_to_close} | PnL {pnl:.4f} | Balance {paper_balance:.2f}")
+        return True
+
     try:
         contracts = safe_float(position.get("contracts", 0))
         if contracts <= 0:
@@ -1112,6 +1260,16 @@ async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: st
         context,
         (
             f"📌 Position Closed\n"
+            f"Mode: {get_trade_mode_text()}\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side}\n"
+            f"Reason: {reason}\n"
+            f"Entry: {format_num(entry, 6)}\n"
+            f"Exit: {format_num(exit_price, 6)}\n"
+            f"PnL%: {format_num(pnl_pct, 2)}%\n"
+            f"Paper Balance: {paper_balance:.2f} USDT" if TRADING_MODE == "PAPER" else
+            f"📌 Position Closed\n"
+            f"Mode: {get_trade_mode_text()}\n"
             f"Symbol: {symbol}\n"
             f"Side: {side}\n"
             f"Reason: {reason}\n"
@@ -1161,8 +1319,13 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 "opened_at": now_ts(),
                 "entry_score": 0,
                 "entry_reason": "Recovered open position",
+                "status": "open",
+                "amount": contracts,
+                "remaining_amount": contracts,
             }
             state = trade_state[symbol]
+            if TRADING_MODE == "PAPER":
+                save_paper_to_disk()
 
         bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
         if not bars_15m:
@@ -1181,6 +1344,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1193,6 +1357,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1200,9 +1365,10 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
+                    save_paper_to_disk()
                     await notify(
                         context,
-                        f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
+                        f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100\nMode: {get_trade_mode_text()}"
                     )
                     continue
 
@@ -1212,9 +1378,10 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["tp2_taken"] = True
                     state["trailing_active"] = True
                     state["trailing_stop"] = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
+                    save_paper_to_disk()
                     await notify(
                         context,
-                        f"🚀 TP2 LONG\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
+                        f"🚀 TP2 LONG\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100\nMode: {get_trade_mode_text()}"
                     )
                     continue
 
@@ -1224,6 +1391,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1233,6 +1401,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["trailing_stop"] = new_trailing
                 else:
                     state["trailing_stop"] = max(state["trailing_stop"], new_trailing)
+                save_paper_to_disk()
 
                 if mark_price <= state["trailing_stop"]:
                     refreshed = get_symbol_position(symbol) or pos
@@ -1240,6 +1409,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                         record_closed_trade(symbol, entry_price, mark_price, side)
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
+                        save_paper_to_disk()
                         set_cooldown(symbol)
                     continue
 
@@ -1249,6 +1419,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1261,6 +1432,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1268,9 +1440,10 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
+                    save_paper_to_disk()
                     await notify(
                         context,
-                        f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
+                        f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100\nMode: {get_trade_mode_text()}"
                     )
                     continue
 
@@ -1280,9 +1453,10 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["tp2_taken"] = True
                     state["trailing_active"] = True
                     state["trailing_stop"] = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
+                    save_paper_to_disk()
                     await notify(
                         context,
-                        f"🚀 TP2 SHORT\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
+                        f"🚀 TP2 SHORT\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100\nMode: {get_trade_mode_text()}"
                     )
                     continue
 
@@ -1292,6 +1466,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     record_closed_trade(symbol, entry_price, mark_price, side)
                     await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
+                    save_paper_to_disk()
                     set_cooldown(symbol)
                 continue
 
@@ -1301,6 +1476,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                     state["trailing_stop"] = new_trailing
                 else:
                     state["trailing_stop"] = min(state["trailing_stop"], new_trailing)
+                save_paper_to_disk()
 
                 if mark_price >= state["trailing_stop"]:
                     refreshed = get_symbol_position(symbol) or pos
@@ -1308,6 +1484,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                         record_closed_trade(symbol, entry_price, mark_price, side)
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
+                        save_paper_to_disk()
                         set_cooldown(symbol)
                     continue
 
@@ -1375,6 +1552,7 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                     context,
                     (
                         f"🚀 Binance Ichimoku Smart Trade Opened\n"
+                        f"Mode: {get_trade_mode_text()}\n"
                         f"Symbol: {symbol}\n"
                         f"Side: {entry_side}\n"
                         f"SmartScore: {score}/100\n"
@@ -1385,8 +1563,9 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
                         f"TP2: {format_num(plan['tp2'], 6)}\n"
                         f"Amount: {plan['amount']}\n"
                         f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%\n"
-                        f"Mode: {BOT_MODE}\n"
-                        f"Leverage: {get_current_leverage()}x"
+                        f"Strategy Mode: {BOT_MODE}\n"
+                        f"Leverage: {get_current_leverage()}x\n"
+                        f"Balance: {fetch_balance_usdt():.2f} USDT"
                     )
                 )
                 scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
@@ -1480,7 +1659,7 @@ async def show_positions(message_target, positions: List[dict]):
     if not lines:
         await message_target.reply_text("لا توجد صفقات مفتوحة.")
     else:
-        await message_target.reply_text("📂 الصفقات المفتوحة:\n" + "\n".join(lines[:20]))
+        await message_target.reply_text(f"📂 الصفقات المفتوحة:\nMode: {get_trade_mode_text()}\n" + "\n".join(lines[:20]))
 
 
 async def close_by_pnl(update_or_message, mode: str):
@@ -1504,8 +1683,14 @@ async def close_by_pnl(update_or_message, mode: str):
         if not should_close:
             continue
 
+        entry_price = safe_float(p.get("entryPrice", 0))
+        mark_price = safe_float(p.get("markPrice", 0))
+        side = "LONG" if str(p.get("side", "")).lower() == "long" else "SHORT"
+
         if close_position(symbol, p, 1.0):
+            record_closed_trade(symbol, entry_price, mark_price, side)
             trade_state.pop(symbol, None)
+            save_paper_to_disk()
             set_cooldown(symbol)
             count += 1
 
@@ -1515,6 +1700,9 @@ async def close_by_pnl(update_or_message, mode: str):
         msg = f"✅ تم طلب إغلاق {count} صفقة رابحة."
     else:
         msg = f"❌ تم طلب إغلاق {count} صفقة خاسرة."
+
+    if TRADING_MODE == "PAPER":
+        msg += f"\n💰 Paper Balance: {paper_balance:.2f} USDT"
 
     await update_or_message.reply_text(msg)
 
@@ -1526,7 +1714,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         context.bot_data["chat_id"] = str(update.effective_chat.id)
     await update.message.reply_text(
-        "🤖 Binance Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:",
+        f"🤖 Binance Ichimoku Smart Bot جاهز.\n"
+        f"وضع التداول: {get_trade_mode_text()}\n"
+        f"استخدم لوحة التحكم:",
         reply_markup=dashboard_kb()
     )
 
@@ -1536,6 +1726,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = fetch_balance_usdt()
     await update.message.reply_text(
         f"📊 الحالة Binance\n"
+        f"وضع التداول: {get_trade_mode_text()}\n"
         f"الوضع: {get_mode_text()}\n"
         f"الاستراتيجية: Ichimoku Smart Score\n"
         f"متوقف: {paused}\n"
@@ -1551,7 +1742,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = fetch_balance_usdt()
-    await update.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
+    if TRADING_MODE == "PAPER":
+        await update.message.reply_text(f"💰 Paper Balance: {bal:.2f} USDT")
+    else:
+        await update.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1619,7 +1813,10 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "dash_balance":
         bal = fetch_balance_usdt()
-        await query.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
+        if TRADING_MODE == "PAPER":
+            await query.message.reply_text(f"💰 Paper Balance: {bal:.2f} USDT")
+        else:
+            await query.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
 
     elif data == "dash_radar":
         await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
@@ -1683,12 +1880,17 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"ICHIMOKU_SMART_BINANCE_BOT_LIVE")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 
 # =========================================================
 # 12) MAIN
 # =========================================================
 def main():
     load_stats_from_disk()
+    load_paper_from_disk()
 
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
@@ -1725,7 +1927,7 @@ def main():
     app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
     app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
 
-    logger.info("Starting Binance Ichimoku Smart Bot...")
+    logger.info(f"Starting Binance Ichimoku Smart Bot... Trading Mode: {TRADING_MODE}")
     app.run_polling(drop_pending_updates=True)
 
 
