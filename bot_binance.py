@@ -38,6 +38,13 @@ PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
 PAPER_FILE = Path("paper_binance.json")
 paper_balance = PAPER_START_BALANCE
 
+# DATA_EXCHANGE:
+# OKX = الأفضل لـ Render إذا Binance ما يرجع بيانات NO_DATA
+# BINANCE = استخدم Binance كمصدر بيانات
+DATA_EXCHANGE = os.getenv("DATA_EXCHANGE", "OKX").upper()
+if DATA_EXCHANGE not in ("OKX", "BINANCE"):
+    DATA_EXCHANGE = "OKX"
+
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
 
@@ -142,6 +149,16 @@ exchange = ccxt.binanceusdm(exchange_config)
 
 if BINANCE_TESTNET:
     exchange.set_sandbox_mode(True)
+
+if DATA_EXCHANGE == "OKX":
+    data_exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+        },
+    })
+else:
+    data_exchange = exchange
 
 # =========================================================
 # 2) STATE
@@ -778,9 +795,10 @@ def load_paper_from_disk() -> None:
 
 def paper_mark_price(symbol: str, fallback: float = 0.0) -> float:
     try:
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = data_exchange.fetch_ticker(data_symbol(symbol))
         return safe_float(ticker.get("last") or ticker.get("mark") or ticker.get("close"), fallback)
-    except Exception:
+    except Exception as e:
+        logger.error(f"{symbol} ticker DATA ERROR from {DATA_EXCHANGE}: {str(e)}")
         return fallback
 
 
@@ -865,11 +883,25 @@ def count_open_positions() -> int:
     return count
 
 
+def data_symbol(symbol: str) -> str:
+    """
+    Binance USDT-M symbols and OKX swap symbols use the same ccxt format for most pairs:
+    BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT...
+    Keeping this function makes future exchange mapping easy.
+    """
+    return symbol
+
+
 def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> Optional[List[List[float]]]:
     try:
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        source_symbol = data_symbol(symbol)
+        data = data_exchange.fetch_ohlcv(source_symbol, timeframe=timeframe, limit=limit)
+        if not data:
+            logger.error(f"{symbol} {timeframe} EMPTY DATA from {DATA_EXCHANGE}")
+            return None
+        return data
     except Exception as e:
-        logger.error(f"{symbol} {timeframe} fetch_ohlcv error: {e}")
+        logger.error(f"{symbol} {timeframe} DATA ERROR from {DATA_EXCHANGE}: {str(e)}")
         return None
 
 
@@ -1715,7 +1747,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["chat_id"] = str(update.effective_chat.id)
     await update.message.reply_text(
         f"🤖 Binance Ichimoku Smart Bot جاهز.\n"
-        f"وضع التداول: {get_trade_mode_text()}\n"
+        f"وضع التداول: {get_trade_mode_text()}\nمصدر البيانات: {DATA_EXCHANGE}\n"
         f"استخدم لوحة التحكم:",
         reply_markup=dashboard_kb()
     )
@@ -1727,6 +1759,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 الحالة Binance\n"
         f"وضع التداول: {get_trade_mode_text()}\n"
+        f"مصدر البيانات: {DATA_EXCHANGE}\n"
         f"الوضع: {get_mode_text()}\n"
         f"الاستراتيجية: Ichimoku Smart Score\n"
         f"متوقف: {paused}\n"
