@@ -58,7 +58,7 @@ SYMBOLS = [
     "AVAX/USDT:USDT",
     "LTC/USDT:USDT",
     "TRX/USDT:USDT",
-    "BCH/USDT:USDT",
+     
     "ATOM/USDT:USDT",
     "NEAR/USDT:USDT",
 ]
