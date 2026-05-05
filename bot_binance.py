@@ -1,38 +1,59 @@
 import os
 import json
-import math
-import time
 import asyncio
+import time
 import logging
+import threading
 from pathlib import Path
-from datetime import datetime, timezone, date
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional, Dict, Any, List, Tuple
 
 import ccxt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    CallbackQueryHandler,
 )
 
 # =========================================================
 # 1) CONFIG
 # =========================================================
-
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINGX_API_KEY = os.getenv("BINGX_API_KEY")
+BINGX_SECRET = os.getenv("BINGX_SECRET")
+PORT = int(os.environ.get("PORT", "8080"))
 
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
+if not BINGX_API_KEY or not BINGX_SECRET:
+    raise RuntimeError("Missing BINGX_API_KEY or BINGX_SECRET")
 
-TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()  # paper only in this version
-START_BALANCE = float(os.getenv("START_BALANCE", "100"))
-STATE_FILE = Path(os.getenv("STATE_FILE", "sar_pro_state.json"))
+# IMPORTANT FOR RENDER:
+# Add Persistent Disk and set DATA_DIR=/data
+# If DATA_DIR is not set, files will be saved in the current project folder and may reset after deploy.
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-TIMEFRAME_ENTRY = "15m"
-TIMEFRAME_TREND = "1h"
+STATS_FILE = DATA_DIR / "stats.json"
+JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
+STATE_FILE = DATA_DIR / "trade_state.json"
+COOLDOWNS_FILE = DATA_DIR / "cooldowns.json"
+
+# BingX Perpetual USDT-M
+MARGIN_MODE = "isolated"
+
+# Mode system
+BOT_MODE = os.getenv("BOT_MODE", "NORMAL").upper()
+if BOT_MODE not in ("NORMAL", "AGGRESSIVE"):
+    BOT_MODE = "NORMAL"
+
+NORMAL_LEVERAGE = 3
+AGGRESSIVE_LEVERAGE = 5
+DEFAULT_LEVERAGE = NORMAL_LEVERAGE
 
 SYMBOLS = [
     "BTC/USDT:USDT",
@@ -43,753 +64,1840 @@ SYMBOLS = [
     "ADA/USDT:USDT",
     "DOGE/USDT:USDT",
     "LINK/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LTC/USDT:USDT",
+    "TRX/USDT:USDT",
+    "ATOM/USDT:USDT",
+    "NEAR/USDT:USDT",
 ]
 
-# Strategy settings
-EMA_PERIOD = 200
-RSI_PERIOD = 14
+TF_4H = "4h"
+TF_1H = "1h"
+TF_15M = "15m"
+
+MAX_OPEN_POSITIONS = 2
+COOLDOWN_MINUTES = 60
+
+# Risk can be changed from Telegram
+risk_per_trade = 0.005  # 0.5%
+
 ATR_PERIOD = 14
-SAR_STEP = 0.02
-SAR_MAX = 0.2
+RSI_PERIOD = 14
+EMA_FAST_PERIOD = 20
+VOLUME_SMA_PERIOD = 20
 
-# Risk settings
-NORMAL_RISK_PCT = 0.005       # 0.5%
-AGGRESSIVE_RISK_PCT = 0.0075  # 0.75%
-DEFAULT_RISK_MODE = "normal"
+# Ichimoku settings
+ICHIMOKU_TENKAN = 9
+ICHIMOKU_KIJUN = 26
+ICHIMOKU_SENKOU_B = 52
+ICHIMOKU_DISPLACEMENT = 26
 
-ATR_SL_MULT = 1.5
-TP1_R = 1.0
-TP2_R = 2.2
-TP1_CLOSE_PCT = 0.50
+# Smart score thresholds
+ENTRY_SCORE = 82
+WATCH_SCORE = 70
+MIN_RR = 1.35
 
-# Quality filters
-MIN_ATR_PCT = 0.0015
-MAX_ATR_PCT = 0.035
-MIN_VOLUME_RATIO = 0.05
-MAX_DISTANCE_FROM_EMA = 0.055
-MAX_OPEN_TRADES = 3
-SCAN_SECONDS = 60
+# Entry filters
+MAX_DISTANCE_FROM_KIJUN_15M = 0.018
+MAX_ATR_PERCENT_15M = 0.035
+MIN_ATR_PERCENT_15M = 0.0015
 
-# RSI pullback logic
-LONG_RSI_RECOVERY_LEVEL = 30
-LONG_RSI_MAX_ENTRY = 55
-SHORT_RSI_RECOVERY_LEVEL = 70
-SHORT_RSI_MIN_ENTRY = 45
+# Exit logic
+TP1_R = 0.9
+TP2_R = 1.8
+TRAILING_ATR_MULTIPLIER = 1.15
+EARLY_EXIT_SCORE = 45
+EMERGENCY_EXIT_SCORE = 35
 
-# Logging
+SCAN_INTERVAL_SECONDS = 60
+POSITION_CHECK_INTERVAL_SECONDS = 20
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("SAR_PRO_BOT")
+logger = logging.getLogger("ICHIMOKU_SMART_BOT")
 
-# =========================================================
-# 2) EXCHANGE
-# =========================================================
-
-exchange = ccxt.okx({
+exchange = ccxt.bingx({
+    "apiKey": BINGX_API_KEY,
+    "secret": BINGX_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
+    "options": {
+        "defaultType": "swap",
+    },
 })
 
 # =========================================================
-# 3) STATE
+# 2) STATE
 # =========================================================
+cooldowns: Dict[str, int] = {}
+trade_state: Dict[str, Dict[str, Any]] = {}
+last_scan_summary = "No scans yet."
+last_signal_summary = "No signals yet."
+bot_paused = False
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-def today_key() -> str:
-    return date.today().isoformat()
-
-def default_state() -> Dict[str, Any]:
-    return {
-        "balance": START_BALANCE,
-        "bot_running": True,
-        "risk_mode": DEFAULT_RISK_MODE,
-        "emergency_stop": False,
-        "open_trades": [],
-        "closed_trades": [],
-        "last_scan": {},
-        "daily": {},
-    }
-
-def load_state() -> Dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            base = default_state()
-            base.update(data)
-            return base
-        except Exception as e:
-            logger.warning(f"Could not load state file: {e}")
-    return default_state()
-
-STATE = load_state()
-
-def save_state() -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(STATE, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
-
-def risk_pct() -> float:
-    return AGGRESSIVE_RISK_PCT if STATE.get("risk_mode") == "aggressive" else NORMAL_RISK_PCT
+daily_stats = {}
+all_stats = {}
 
 # =========================================================
-# 4) INDICATORS
+# 3) BASIC HELPERS
 # =========================================================
+def now_ts() -> int:
+    return int(time.time())
 
-def safe_float(x, default=0.0) -> float:
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def utc_today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def safe_float(value, default: float = 0.0) -> float:
     try:
-        if x is None:
+        if value is None:
             return default
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
-def ema(values: List[float], period: int) -> List[Optional[float]]:
-    if len(values) < period:
-        return [None] * len(values)
-    out = [None] * len(values)
-    k = 2 / (period + 1)
-    first = sum(values[:period]) / period
-    out[period - 1] = first
-    prev = first
-    for i in range(period, len(values)):
-        prev = values[i] * k + prev * (1 - k)
-        out[i] = prev
-    return out
 
-def rsi(values: List[float], period: int = 14) -> List[Optional[float]]:
-    if len(values) <= period:
-        return [None] * len(values)
-    out = [None] * len(values)
-    gains, losses = [], []
+def format_num(v: float, digits: int = 6) -> str:
+    try:
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return str(v)
+
+
+def get_current_leverage() -> int:
+    return AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+
+
+def get_mode_text() -> str:
+    return f"{BOT_MODE} ({get_current_leverage()}x)"
+
+
+def get_active_chat_id(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[str]:
+    if context and context.bot_data.get("chat_id"):
+        return str(context.bot_data["chat_id"])
+    if ENV_CHAT_ID:
+        return str(ENV_CHAT_ID)
+    return None
+
+
+async def notify(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    chat_id = get_active_chat_id(context)
+    if not chat_id:
+        logger.info("No active chat id yet; skipping notification")
+        return
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Telegram notify error: {e}")
+
+
+def is_in_cooldown(symbol: str) -> bool:
+    return now_ts() < int(cooldowns.get(symbol, 0))
+
+
+def set_cooldown(symbol: str) -> None:
+    cooldowns[symbol] = now_ts() + COOLDOWN_MINUTES * 60
+    save_runtime_state()
+
+
+def sma(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    val = sum(values[:period]) / period
+    for x in values[period:]:
+        val = x * k + val * (1 - k)
+    return val
+
+
+def rsi(values: List[float], period: int = RSI_PERIOD) -> Optional[float]:
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
     for i in range(1, period + 1):
         diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
-    out[period] = 100 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+
     for i in range(period + 1, len(values)):
         diff = values[i] - values[i - 1]
-        gain = max(diff, 0)
-        loss = abs(min(diff, 0))
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        out[i] = 100 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
-    return out
+        gain = max(diff, 0.0)
+        loss = max(-diff, 0.0)
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
 
-def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
-    if len(closes) <= period:
-        return [None] * len(closes)
-    trs = [0.0]
-    for i in range(1, len(closes)):
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def atr_from_ohlcv(ohlcv: List[List[float]], period: int) -> Optional[float]:
+    if len(ohlcv) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(ohlcv)):
+        prev_close = ohlcv[i - 1][4]
+        curr_high = ohlcv[i][2]
+        curr_low = ohlcv[i][3]
         tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
+            curr_high - curr_low,
+            abs(curr_high - prev_close),
+            abs(curr_low - prev_close),
         )
         trs.append(tr)
-    out = [None] * len(closes)
-    first = sum(trs[1:period + 1]) / period
-    out[period] = first
-    prev = first
-    for i in range(period + 1, len(closes)):
-        prev = (prev * (period - 1) + trs[i]) / period
-        out[i] = prev
-    return out
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
 
-def parabolic_sar(highs: List[float], lows: List[float], step: float = 0.02, max_step: float = 0.2) -> List[Optional[float]]:
-    n = len(highs)
-    if n < 5:
-        return [None] * n
 
-    psar = [None] * n
-    bull = highs[1] > highs[0]
-    af = step
-    ep = highs[0] if bull else lows[0]
-    sar = lows[0] if bull else highs[0]
-
-    for i in range(1, n):
-        prev_sar = sar
-        sar = prev_sar + af * (ep - prev_sar)
-
-        if bull:
-            sar = min(sar, lows[i - 1])
-            if i >= 2:
-                sar = min(sar, lows[i - 2])
-
-            if lows[i] < sar:
-                bull = False
-                sar = ep
-                ep = lows[i]
-                af = step
-            else:
-                if highs[i] > ep:
-                    ep = highs[i]
-                    af = min(af + step, max_step)
-        else:
-            sar = max(sar, highs[i - 1])
-            if i >= 2:
-                sar = max(sar, highs[i - 2])
-
-            if highs[i] > sar:
-                bull = True
-                sar = ep
-                ep = highs[i]
-                af = step
-            else:
-                if lows[i] < ep:
-                    ep = lows[i]
-                    af = min(af + step, max_step)
-
-        psar[i] = sar
-
-    return psar
-
-# =========================================================
-# 5) MARKET DATA
-# =========================================================
-
-async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 260) -> Optional[List[List[float]]]:
+def normalize_amount(symbol: str, amount: float) -> float:
     try:
-        data = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
-        if not data or len(data) < 220:
-            return None
-        return data
+        return float(exchange.amount_to_precision(symbol, amount))
+    except Exception:
+        return amount
+
+
+def normalize_price(symbol: str, price: float) -> float:
+    try:
+        return float(exchange.price_to_precision(symbol, price))
+    except Exception:
+        return price
+
+# =========================================================
+# 3.1) PERSISTENT RUNTIME STATE + JOURNAL
+# =========================================================
+def append_journal(event_type: str, payload: dict) -> None:
+    """Append every important trade event to JSONL so deploys do not erase history."""
+    try:
+        row = {
+            "ts": utc_now_iso(),
+            "event": event_type,
+            **payload,
+        }
+        with JOURNAL_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as e:
-        logger.warning(f"NO_DATA {symbol} {timeframe}: {e}")
+        logger.error(f"append_journal error: {e}")
+
+
+def save_runtime_state() -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(trade_state, ensure_ascii=False, indent=2), encoding="utf-8")
+        COOLDOWNS_FILE.write_text(json.dumps(cooldowns, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save_runtime_state error: {e}")
+
+
+def load_runtime_state() -> None:
+    global trade_state, cooldowns
+    try:
+        if STATE_FILE.exists():
+            trade_state = json.loads(STATE_FILE.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.error(f"load trade_state error: {e}")
+        trade_state = {}
+
+    try:
+        if COOLDOWNS_FILE.exists():
+            cooldowns = json.loads(COOLDOWNS_FILE.read_text(encoding="utf-8")) or {}
+            cooldowns = {str(k): int(v) for k, v in cooldowns.items()}
+    except Exception as e:
+        logger.error(f"load cooldowns error: {e}")
+        cooldowns = {}
+
+
+def get_recent_journal_lines(limit: int = 10) -> List[dict]:
+    try:
+        if not JOURNAL_FILE.exists():
+            return []
+        lines = JOURNAL_FILE.read_text(encoding="utf-8").splitlines()
+        rows = []
+        for line in lines[-limit:]:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        return rows
+    except Exception as e:
+        logger.error(f"get_recent_journal_lines error: {e}")
+        return []
+
+
+def build_journal_text(limit: int = 10) -> str:
+    rows = get_recent_journal_lines(limit)
+    if not rows:
+        return "📒 لا يوجد سجل صفقات محفوظ حتى الآن."
+
+    lines = [f"📒 آخر {len(rows)} أحداث في سجل الصفقات:"]
+    for r in rows:
+        ts = str(r.get("ts", ""))[:19]
+        event = r.get("event", "-")
+        symbol = r.get("symbol", "-")
+        side = r.get("side", "-")
+        reason = r.get("reason", r.get("stage", ""))
+        pnl = r.get("pnl_pct")
+        pnl_text = f" | PnL {safe_float(pnl):.2f}%" if pnl is not None else ""
+        lines.append(f"{ts} | {event} | {symbol} | {side} | {reason}{pnl_text}")
+    return "\n".join(lines)
+
+# =========================================================
+# 3.2) ICHIMOKU HELPERS
+# =========================================================
+def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> Optional[float]:
+    start = end_index - period + 1
+    if start < 0:
+        return None
+    window = ohlcv[start:end_index + 1]
+    high = max(c[2] for c in window)
+    low = min(c[3] for c in window)
+    return (high + low) / 2
+
+
+def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
+    required = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 5
+    if len(ohlcv) < required:
         return None
 
-def candles_to_arrays(candles: List[List[float]]) -> Tuple[List[float], List[float], List[float], List[float]]:
-    highs = [safe_float(c[2]) for c in candles]
-    lows = [safe_float(c[3]) for c in candles]
-    closes = [safe_float(c[4]) for c in candles]
-    volumes = [safe_float(c[5]) for c in candles]
-    return highs, lows, closes, volumes
+    last = len(ohlcv) - 1
+    cloud_source = last - ICHIMOKU_DISPLACEMENT
 
-def has_open_trade(symbol: str) -> bool:
-    return any(t["symbol"] == symbol and t["status"] == "open" for t in STATE["open_trades"])
+    tenkan_now = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, last)
+    kijun_now = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, last)
 
-def volume_ratio(volumes: List[float], lookback: int = 20) -> float:
-    if len(volumes) < lookback + 1:
+    tenkan_cloud = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, cloud_source)
+    kijun_cloud = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, cloud_source)
+    span_b_current = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, cloud_source)
+
+    if tenkan_now is None or kijun_now is None or tenkan_cloud is None or kijun_cloud is None or span_b_current is None:
+        return None
+
+    span_a_current = (tenkan_cloud + kijun_cloud) / 2
+    cloud_top = max(span_a_current, span_b_current)
+    cloud_bottom = min(span_a_current, span_b_current)
+    close = ohlcv[-1][4]
+
+    span_a_future = (tenkan_now + kijun_now) / 2
+    span_b_future = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, last)
+    if span_b_future is None:
+        return None
+
+    if close > cloud_top:
+        price_vs_cloud = "ABOVE"
+    elif close < cloud_bottom:
+        price_vs_cloud = "BELOW"
+    else:
+        price_vs_cloud = "INSIDE"
+
+    tk_bias = "BULL" if tenkan_now > kijun_now else "BEAR" if tenkan_now < kijun_now else "FLAT"
+    future_cloud_bias = "BULL" if span_a_future > span_b_future else "BEAR" if span_a_future < span_b_future else "FLAT"
+    cloud_thickness = abs(cloud_top - cloud_bottom) / close if close > 0 else 999
+
+    return {
+        "tenkan": tenkan_now,
+        "kijun": kijun_now,
+        "span_a_current": span_a_current,
+        "span_b_current": span_b_current,
+        "cloud_top": cloud_top,
+        "cloud_bottom": cloud_bottom,
+        "price_vs_cloud": price_vs_cloud,
+        "tk_bias": tk_bias,
+        "future_cloud_bias": future_cloud_bias,
+        "cloud_thickness": cloud_thickness,
+    }
+
+
+def ichimoku_trend(ichi: dict) -> str:
+    if ichi["price_vs_cloud"] == "ABOVE" and ichi["tk_bias"] == "BULL":
+        return "BULL"
+    if ichi["price_vs_cloud"] == "BELOW" and ichi["tk_bias"] == "BEAR":
+        return "BEAR"
+    if ichi["price_vs_cloud"] == "INSIDE":
+        return "RANGE"
+    return "MIXED"
+
+
+def candle_strength(ohlcv: List[List[float]]) -> dict:
+    if len(ohlcv) < 3:
+        return {"body_ratio": 0.0, "direction": "FLAT"}
+    o, h, l, c = ohlcv[-1][1], ohlcv[-1][2], ohlcv[-1][3], ohlcv[-1][4]
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_ratio = body / rng
+    direction = "BULL" if c > o else "BEAR" if c < o else "FLAT"
+    return {"body_ratio": body_ratio, "direction": direction}
+
+
+def recent_structure(ohlcv: List[List[float]], lookback: int = 8) -> str:
+    if len(ohlcv) < lookback + 3:
+        return "UNKNOWN"
+    highs = [c[2] for c in ohlcv[-lookback:]]
+    lows = [c[3] for c in ohlcv[-lookback:]]
+    if highs[-1] > highs[0] and lows[-1] > lows[0]:
+        return "BULL"
+    if highs[-1] < highs[0] and lows[-1] < lows[0]:
+        return "BEAR"
+    return "RANGE"
+
+
+def volume_ok(ohlcv: List[List[float]]) -> Tuple[bool, float]:
+    if len(ohlcv) < VOLUME_SMA_PERIOD + 1:
+        return False, 0.0
+    vols = [safe_float(c[5]) for c in ohlcv]
+    avg = sma(vols[:-1], VOLUME_SMA_PERIOD)
+    current = vols[-1]
+    if not avg or avg <= 0:
+        return False, 0.0
+    ratio = current / avg
+    return ratio >= 0.9, ratio
+
+
+def score_setup(
+    side: str,
+    bars_4h: List[List[float]],
+    bars_1h: List[List[float]],
+    bars_15m: List[List[float]],
+    ichi_4h: dict,
+    ichi_1h: dict,
+    ichi_15m: dict,
+    atr_15m: float,
+    rsi_15m: float,
+) -> dict:
+    close_15m = bars_15m[-1][4]
+    atr_pct = atr_15m / close_15m if close_15m > 0 else 999
+    candle = candle_strength(bars_15m)
+    structure_15m = recent_structure(bars_15m)
+    vol_ok, vol_ratio = volume_ok(bars_15m)
+
+    score = 0
+    reasons = []
+
+    trend_4h = ichimoku_trend(ichi_4h)
+    trend_1h = ichimoku_trend(ichi_1h)
+    trend_15m = ichimoku_trend(ichi_15m)
+
+    want = "BULL" if side == "LONG" else "BEAR"
+    cloud_side = "ABOVE" if side == "LONG" else "BELOW"
+
+    if trend_4h == want:
+        score += 25
+        reasons.append(f"4H {want} فوق/تحت السحابة بشكل واضح")
+    elif ichi_4h["price_vs_cloud"] == cloud_side:
+        score += 15
+        reasons.append("4H السعر في جهة الاتجاه لكن Tenkan/Kijun غير مثالي")
+    elif trend_4h == "RANGE":
+        score -= 25
+        reasons.append("4H داخل السحابة = سوق غير واضح")
+    else:
+        score -= 35
+        reasons.append("4H ضد اتجاه الصفقة")
+
+    if trend_1h == want:
+        score += 20
+        reasons.append(f"1H يؤكد الاتجاه {want}")
+    elif ichi_1h["price_vs_cloud"] == cloud_side:
+        score += 10
+        reasons.append("1H في جهة الاتجاه لكن التأكيد متوسط")
+    elif trend_1h == "RANGE":
+        score -= 15
+        reasons.append("1H داخل السحابة")
+    else:
+        score -= 25
+        reasons.append("1H ضد الصفقة")
+
+    if trend_15m == want:
+        score += 15
+        reasons.append("15m متوافق للدخول")
+    elif ichi_15m["price_vs_cloud"] == cloud_side:
+        score += 8
+        reasons.append("15m فوق/تحت السحابة لكن الزخم متوسط")
+    else:
+        score -= 12
+        reasons.append("15m غير مناسب للدخول")
+
+    distance_kijun = abs(close_15m - ichi_15m["kijun"]) / ichi_15m["kijun"] if ichi_15m["kijun"] > 0 else 999
+    if distance_kijun <= MAX_DISTANCE_FROM_KIJUN_15M:
+        score += 12
+        reasons.append("الدخول قريب من Kijun وليس مطاردة")
+    else:
+        score -= 10
+        reasons.append("السعر بعيد عن Kijun، احتمال الدخول متأخر")
+
+    if ichi_1h["future_cloud_bias"] == want and ichi_15m["tk_bias"] == want:
+        score += 10
+        reasons.append("زخم Ichimoku داعم")
+    elif ichi_15m["tk_bias"] == want:
+        score += 5
+        reasons.append("زخم 15m داعم جزئيًا")
+
+    if candle["direction"] == want and candle["body_ratio"] >= 0.45:
+        score += 8
+        reasons.append("شمعة الدخول قوية")
+    elif candle["direction"] != want:
+        score -= 8
+        reasons.append("شمعة الدخول عكس الاتجاه")
+
+    if structure_15m == want:
+        score += 6
+        reasons.append("هيكل 15m داعم")
+    elif structure_15m == "RANGE":
+        score -= 4
+        reasons.append("هيكل 15m عرضي")
+
+    if vol_ok:
+        score += 5
+        reasons.append(f"الحجم جيد ({vol_ratio:.2f}x)")
+    else:
+        score -= 3
+        reasons.append(f"الحجم ضعيف ({vol_ratio:.2f}x)")
+
+    if MIN_ATR_PERCENT_15M <= atr_pct <= MAX_ATR_PERCENT_15M:
+        score += 4
+        reasons.append("التذبذب مناسب")
+    elif atr_pct > MAX_ATR_PERCENT_15M:
+        score -= 18
+        reasons.append("التذبذب عالي جدًا")
+    else:
+        score -= 10
+        reasons.append("السوق بارد جدًا")
+
+    if side == "LONG":
+        if 42 <= rsi_15m <= 68:
+            score += 5
+            reasons.append("RSI مناسب للونق")
+        elif rsi_15m > 75:
+            score -= 12
+            reasons.append("RSI مرتفع جدًا، احتمال مطاردة")
+    else:
+        if 32 <= rsi_15m <= 58:
+            score += 5
+            reasons.append("RSI مناسب للشورت")
+        elif rsi_15m < 25:
+            score -= 12
+            reasons.append("RSI منخفض جدًا، احتمال مطاردة")
+
+    score = max(0, min(100, score))
+
+    return {
+        "score": score,
+        "reasons": reasons,
+        "atr_pct": atr_pct,
+        "distance_kijun": distance_kijun,
+        "trend_4h": trend_4h,
+        "trend_1h": trend_1h,
+        "trend_15m": trend_15m,
+        "volume_ratio": vol_ratio,
+        "rsi": rsi_15m,
+    }
+
+
+def decide_best_side(
+    bars_4h: List[List[float]],
+    bars_1h: List[List[float]],
+    bars_15m: List[List[float]],
+    ichi_4h: dict,
+    ichi_1h: dict,
+    ichi_15m: dict,
+    atr_15m: float,
+    rsi_15m: float,
+) -> Tuple[Optional[str], dict, dict]:
+    long_score = score_setup("LONG", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
+    short_score = score_setup("SHORT", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
+
+    if long_score["score"] > short_score["score"] and long_score["score"] >= WATCH_SCORE:
+        return "LONG", long_score, short_score
+    if short_score["score"] > long_score["score"] and short_score["score"] >= WATCH_SCORE:
+        return "SHORT", short_score, long_score
+
+    return None, long_score, short_score
+
+# =========================================================
+# 3.3) STATS PERSISTENCE
+# =========================================================
+def empty_daily_stats() -> dict:
+    return {
+        "date": utc_today(),
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+        "partial_closes": 0,
+    }
+
+
+def empty_all_stats() -> dict:
+    return {
+        "started_at": utc_now_iso(),
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+        "best_win": 0.0,
+        "worst_loss": 0.0,
+        "partial_closes": 0,
+        "by_symbol": {},
+    }
+
+
+def save_stats_to_disk() -> None:
+    try:
+        payload = {
+            "daily_stats": daily_stats,
+            "all_stats": all_stats,
+            "data_dir": str(DATA_DIR),
+            "updated_at": utc_now_iso(),
+        }
+        STATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save_stats_to_disk error: {e}")
+
+
+def load_stats_from_disk() -> None:
+    global daily_stats, all_stats
+
+    if not STATS_FILE.exists():
+        daily_stats = empty_daily_stats()
+        all_stats = empty_all_stats()
+        save_stats_to_disk()
+        return
+
+    try:
+        raw = json.loads(STATS_FILE.read_text(encoding="utf-8"))
+        daily_stats = raw.get("daily_stats") or empty_daily_stats()
+        all_stats = raw.get("all_stats") or empty_all_stats()
+    except Exception as e:
+        logger.error(f"load_stats_from_disk error: {e}")
+        daily_stats = empty_daily_stats()
+        all_stats = empty_all_stats()
+        save_stats_to_disk()
+
+    daily_stats.setdefault("date", utc_today())
+    daily_stats.setdefault("closed_trades", 0)
+    daily_stats.setdefault("wins", 0)
+    daily_stats.setdefault("losses", 0)
+    daily_stats.setdefault("realized_pnl", 0.0)
+    daily_stats.setdefault("partial_closes", 0)
+
+    all_stats.setdefault("started_at", utc_now_iso())
+    all_stats.setdefault("closed_trades", 0)
+    all_stats.setdefault("wins", 0)
+    all_stats.setdefault("losses", 0)
+    all_stats.setdefault("realized_pnl", 0.0)
+    all_stats.setdefault("best_win", 0.0)
+    all_stats.setdefault("worst_loss", 0.0)
+    all_stats.setdefault("partial_closes", 0)
+    all_stats.setdefault("by_symbol", {})
+
+    save_stats_to_disk()
+
+
+def reset_daily_stats_if_needed() -> None:
+    global daily_stats
+    today = utc_today()
+    if daily_stats.get("date") != today:
+        daily_stats = empty_daily_stats()
+        save_stats_to_disk()
+
+
+def update_symbol_stats(symbol: str, pnl_pct: float) -> None:
+    symbol_stats = all_stats["by_symbol"].get(symbol, {
+        "closed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "realized_pnl": 0.0,
+        "best_win": 0.0,
+        "worst_loss": 0.0,
+    })
+
+    symbol_stats["closed_trades"] += 1
+    symbol_stats["realized_pnl"] += pnl_pct
+
+    if pnl_pct >= 0:
+        symbol_stats["wins"] += 1
+        symbol_stats["best_win"] = max(safe_float(symbol_stats.get("best_win", 0.0)), pnl_pct)
+    else:
+        symbol_stats["losses"] += 1
+        symbol_stats["worst_loss"] = min(safe_float(symbol_stats.get("worst_loss", 0.0)), pnl_pct)
+
+    all_stats["by_symbol"][symbol] = symbol_stats
+
+
+def estimate_pnl_pct(entry_price: float, exit_price: float, side: str) -> float:
+    if entry_price <= 0:
         return 0.0
-    avg = sum(volumes[-lookback-1:-1]) / lookback
-    if avg <= 0:
-        return 0.0
-    return volumes[-1] / avg
+    if side == "LONG":
+        return ((exit_price - entry_price) / entry_price) * 100
+    return ((entry_price - exit_price) / entry_price) * 100
 
-async def build_signal(symbol: str) -> Dict[str, Any]:
-    candles_15m = await fetch_ohlcv(symbol, TIMEFRAME_ENTRY)
-    candles_1h = await fetch_ohlcv(symbol, TIMEFRAME_TREND)
 
-    if not candles_15m or not candles_1h:
-        return {"symbol": symbol, "signal": "NO_DATA", "reason": "Could not fetch enough candles"}
+def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side: str, reason: str = "Closed") -> float:
+    reset_daily_stats_if_needed()
+    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
 
-    h15, l15, c15, v15 = candles_to_arrays(candles_15m)
-    h1, l1, c1, v1 = candles_to_arrays(candles_1h)
+    daily_stats["closed_trades"] += 1
+    daily_stats["realized_pnl"] += pnl_pct
+    if pnl_pct >= 0:
+        daily_stats["wins"] += 1
+    else:
+        daily_stats["losses"] += 1
 
-    ema200_15 = ema(c15, EMA_PERIOD)[-1]
-    ema200_1h = ema(c1, EMA_PERIOD)[-1]
-    rsi_values = rsi(c15, RSI_PERIOD)
-    atr15 = atr(h15, l15, c15, ATR_PERIOD)[-1]
-    sar_values = parabolic_sar(h15, l15, SAR_STEP, SAR_MAX)
+    all_stats["closed_trades"] += 1
+    all_stats["realized_pnl"] += pnl_pct
+    if pnl_pct >= 0:
+        all_stats["wins"] += 1
+        all_stats["best_win"] = max(safe_float(all_stats.get("best_win", 0.0)), pnl_pct)
+    else:
+        all_stats["losses"] += 1
+        all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
 
-    if None in (ema200_15, ema200_1h, rsi_values[-1], rsi_values[-2], atr15, sar_values[-1], sar_values[-2]):
-        return {"symbol": symbol, "signal": "NO_DATA", "reason": "Indicators not ready"}
+    update_symbol_stats(symbol, pnl_pct)
+    save_stats_to_disk()
 
-    close = c15[-1]
-    prev_close = c15[-2]
-    rsi_now = safe_float(rsi_values[-1])
-    rsi_prev = safe_float(rsi_values[-2])
-    sar_now = safe_float(sar_values[-1])
-    sar_prev = safe_float(sar_values[-2])
-    atr_pct = atr15 / close if close else 999
-    vol_ratio = volume_ratio(v15)
-    distance_ema = abs(close - ema200_15) / close if close else 999
+    append_journal("FULL_CLOSE", {
+        "symbol": symbol,
+        "side": side,
+        "reason": reason,
+        "entry": entry_price,
+        "exit": exit_price,
+        "pnl_pct": pnl_pct,
+    })
+    return pnl_pct
 
-    trend_long = close > ema200_15 and c1[-1] > ema200_1h
-    trend_short = close < ema200_15 and c1[-1] < ema200_1h
 
-    sar_flip_long = sar_prev > prev_close and sar_now < close
-    sar_flip_short = sar_prev < prev_close and sar_now > close
+def record_partial_close(symbol: str, side: str, stage: str, entry_price: float, exit_price: float, portion: float) -> float:
+    reset_daily_stats_if_needed()
+    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
+    daily_stats["partial_closes"] += 1
+    all_stats["partial_closes"] += 1
+    save_stats_to_disk()
+    append_journal("PARTIAL_CLOSE", {
+        "symbol": symbol,
+        "side": side,
+        "stage": stage,
+        "entry": entry_price,
+        "exit": exit_price,
+        "portion": portion,
+        "pnl_pct": pnl_pct,
+    })
+    return pnl_pct
 
+
+def build_today_stats_text() -> str:
+    reset_daily_stats_if_needed()
+    win_rate = 0.0
+    if daily_stats["closed_trades"] > 0:
+        win_rate = (daily_stats["wins"] / daily_stats["closed_trades"]) * 100
+
+    return (
+        f"📈 إحصائيات اليوم\n"
+        f"التاريخ: {daily_stats['date']}\n"
+        f"الصفقات المغلقة نهائيًا: {daily_stats['closed_trades']}\n"
+        f"الإغلاقات الجزئية TP: {daily_stats.get('partial_closes', 0)}\n"
+        f"الرابحة: {daily_stats['wins']}\n"
+        f"الخاسرة: {daily_stats['losses']}\n"
+        f"نسبة النجاح: {win_rate:.2f}%\n"
+        f"إجمالي PnL% تقريبي: {daily_stats['realized_pnl']:.2f}%\n"
+        f"ملاحظة: هذا PnL% سعري تقريبي، والرصيد الحقيقي يعتمد على الرسوم والتمويل وحجم الصفقة."
+    )
+
+
+def build_all_stats_text() -> str:
+    total = all_stats["closed_trades"]
+    wins = all_stats["wins"]
+    losses = all_stats["losses"]
+    pnl = all_stats["realized_pnl"]
+    best_win = all_stats["best_win"]
+    worst_loss = all_stats["worst_loss"]
+
+    win_rate = 0.0
+    if total > 0:
+        win_rate = (wins / total) * 100
+
+    return (
+        f"📊 الإحصائيات الكاملة\n"
+        f"منذ: {all_stats['started_at'][:10]}\n"
+        f"إجمالي الصفقات المغلقة نهائيًا: {total}\n"
+        f"الإغلاقات الجزئية TP: {all_stats.get('partial_closes', 0)}\n"
+        f"الرابحة: {wins}\n"
+        f"الخاسرة: {losses}\n"
+        f"نسبة النجاح: {win_rate:.2f}%\n"
+        f"إجمالي PnL% تقريبي: {pnl:.2f}%\n"
+        f"أفضل صفقة: {best_win:.2f}%\n"
+        f"أسوأ صفقة: {worst_loss:.2f}%\n"
+        f"مسار الحفظ: {DATA_DIR}"
+    )
+
+
+def build_best_symbols_text(limit: int = 5) -> str:
+    stats_by_symbol = all_stats.get("by_symbol", {})
+    if not stats_by_symbol:
+        return "📌 لا توجد بيانات صفقات كافية بعد."
+
+    ranked = sorted(
+        stats_by_symbol.items(),
+        key=lambda item: safe_float(item[1].get("realized_pnl", 0.0)),
+        reverse=True,
+    )[:limit]
+
+    lines = ["🏆 أفضل العملات أداءً:"]
+    for symbol, data in ranked:
+        total = int(data.get("closed_trades", 0))
+        pnl = safe_float(data.get("realized_pnl", 0.0))
+        wins = int(data.get("wins", 0))
+        losses = int(data.get("losses", 0))
+        win_rate = (wins / total * 100) if total > 0 else 0.0
+        lines.append(
+            f"{symbol} | Trades: {total} | WinRate: {win_rate:.1f}% | PnL: {pnl:.2f}% | W/L: {wins}/{losses}"
+        )
+    return "\n".join(lines)
+
+# =========================================================
+# 4) EXCHANGE WRAPPERS
+# =========================================================
+def fetch_balance_details() -> dict:
+    """Return clearer balance view: free, used, total, unrealized PnL, and estimated equity."""
+    try:
+        bal = exchange.fetch_balance({"type": "swap"})
+        usdt = bal.get("USDT") if isinstance(bal.get("USDT"), dict) else {}
+        free = safe_float(usdt.get("free", 0.0))
+        used = safe_float(usdt.get("used", 0.0))
+        total = safe_float(usdt.get("total", 0.0))
+
+        if free == 0 and isinstance(bal.get("free"), dict):
+            free = safe_float(bal["free"].get("USDT", 0.0))
+        if used == 0 and isinstance(bal.get("used"), dict):
+            used = safe_float(bal["used"].get("USDT", 0.0))
+        if total == 0 and isinstance(bal.get("total"), dict):
+            total = safe_float(bal["total"].get("USDT", 0.0))
+
+        unrealized = 0.0
+        for p in fetch_positions():
+            if safe_float(p.get("contracts", 0)) != 0:
+                unrealized += safe_float(p.get("unrealizedPnl", 0.0))
+
+        equity_est = total + unrealized if total > 0 else free + used + unrealized
+        return {
+            "free": free,
+            "used": used,
+            "total": total,
+            "unrealized_pnl": unrealized,
+            "equity_est": equity_est,
+        }
+    except Exception as e:
+        logger.error(f"fetch_balance_details error: {e}")
+        return {"free": 0.0, "used": 0.0, "total": 0.0, "unrealized_pnl": 0.0, "equity_est": 0.0}
+
+
+def build_balance_text() -> str:
+    b = fetch_balance_details()
+    return (
+        f"💰 الرصيد\n"
+        f"Available / المتاح: {b['free']:.2f} USDT\n"
+        f"Used Margin / المحجوز: {b['used']:.2f} USDT\n"
+        f"Wallet Total / الإجمالي: {b['total']:.2f} USDT\n"
+        f"Open PnL / ربح الصفقات المفتوحة: {b['unrealized_pnl']:.4f} USDT\n"
+        f"Estimated Equity / تقدير الحساب: {b['equity_est']:.2f} USDT\n\n"
+        f"مهم: إذا المتاح ينقص، هذا غالبًا بسبب الهامش المحجوز للصفقات المفتوحة، مو شرط خسارة."
+    )
+
+
+def fetch_balance_usdt() -> float:
+    return fetch_balance_details()["free"]
+
+
+def fetch_positions() -> List[dict]:
+    try:
+        return exchange.fetch_positions(params={"type": "swap"})
+    except Exception as e:
+        logger.error(f"fetch_positions error: {e}")
+        return []
+
+
+def get_symbol_position(symbol: str) -> Optional[dict]:
+    try:
+        positions = exchange.fetch_positions([symbol], params={"type": "swap"})
+        for p in positions:
+            if safe_float(p.get("contracts", 0)) != 0:
+                return p
+        return None
+    except Exception as e:
+        logger.error(f"{symbol}: get_symbol_position error: {e}")
+        return None
+
+
+def count_open_positions() -> int:
+    count = 0
+    for pos in fetch_positions():
+        if safe_float(pos.get("contracts", 0)) != 0:
+            count += 1
+    return count
+
+
+def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> Optional[List[List[float]]]:
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        logger.error(f"{symbol} {timeframe} fetch_ohlcv error: {e}")
+        return None
+
+
+def set_leverage_and_margin(symbol: str, leverage: int) -> None:
+    try:
+        exchange.set_position_mode(False, symbol)
+    except Exception as e:
+        logger.warning(f"{symbol}: set position mode warning: {e}")
+
+    try:
+        exchange.set_margin_mode(MARGIN_MODE, symbol)
+    except Exception as e:
+        logger.warning(f"{symbol}: set margin mode warning: {e}")
+
+    try:
+        exchange.set_leverage(leverage, symbol, {"side": "BOTH"})
+    except Exception as e:
+        logger.warning(f"{symbol}: set leverage warning: {e}")
+
+
+def get_order_params(reduce_only: bool = False) -> dict:
+    params = {"positionSide": "BOTH"}
+    if reduce_only:
+        params["reduceOnly"] = True
+    return params
+
+# =========================================================
+# 5) STRATEGY - ICHIMOKU SMART
+# =========================================================
+def build_reason_text(reasons: List[str], limit: int = 4) -> str:
+    if not reasons:
+        return "No detailed reason."
+    return " | ".join(reasons[:limit])
+
+
+def get_market_snapshot(symbol: str) -> Optional[dict]:
+    bars_4h = fetch_ohlcv_safe(symbol, TF_4H, 180)
+    bars_1h = fetch_ohlcv_safe(symbol, TF_1H, 180)
+    bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
+
+    if not bars_4h or not bars_1h or not bars_15m:
+        return None
+
+    ichi_4h = ichimoku_snapshot(bars_4h)
+    ichi_1h = ichimoku_snapshot(bars_1h)
+    ichi_15m = ichimoku_snapshot(bars_15m)
+
+    closes_15m = [b[4] for b in bars_15m]
+    atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
+    rsi_15m = rsi(closes_15m, RSI_PERIOD)
+    ema20_15m = ema(closes_15m, EMA_FAST_PERIOD)
+
+    if not ichi_4h or not ichi_1h or not ichi_15m or atr_15m is None or rsi_15m is None or ema20_15m is None:
+        return None
+
+    best_side, best_score, other_score = decide_best_side(
+        bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
+    )
+
+    close_15m = bars_15m[-1][4]
     base = {
         "symbol": symbol,
-        "close": close,
-        "ema200_15m": ema200_15,
-        "ema200_1h": ema200_1h,
-        "rsi": rsi_now,
-        "rsi_prev": rsi_prev,
-        "atr": atr15,
-        "atr_pct": atr_pct,
-        "sar": sar_now,
-        "volume_ratio": vol_ratio,
-        "distance_ema": distance_ema,
-        "time": utc_now(),
+        "bars_4h": bars_4h,
+        "bars_1h": bars_1h,
+        "bars_15m": bars_15m,
+        "close_15m": close_15m,
+        "atr_15m": atr_15m,
+        "rsi_15m": rsi_15m,
+        "ema20_15m": ema20_15m,
+        "ichi_4h": ichi_4h,
+        "ichi_1h": ichi_1h,
+        "ichi_15m": ichi_15m,
     }
 
-    # Hard filters first
-    if has_open_trade(symbol):
-        return {**base, "signal": "NO_TRADE", "reason": "Already has open trade"}
-
-    if len(STATE["open_trades"]) >= MAX_OPEN_TRADES:
-        return {**base, "signal": "NO_TRADE", "reason": "Max open trades reached"}
-
-    if not (MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT):
-        return {**base, "signal": "NO_TRADE", "reason": f"ATR not suitable {atr_pct:.4f}"}
-
-    if vol_ratio < MIN_VOLUME_RATIO:
-        return {**base, "signal": "WAIT", "reason": f"Weak volume {vol_ratio:.2f}x"}
-
-    if distance_ema > MAX_DISTANCE_FROM_EMA:
-        return {**base, "signal": "WAIT", "reason": "Price too far from EMA200"}
-
-    # LONG
-    if trend_long:
-        rsi_recovery = rsi_prev < LONG_RSI_RECOVERY_LEVEL and rsi_now > LONG_RSI_RECOVERY_LEVEL
-        not_fomo = rsi_now <= LONG_RSI_MAX_ENTRY
-
-        if rsi_recovery and sar_flip_long and not_fomo:
-            return {
-                **base,
-                "signal": "LONG",
-                "side": "LONG",
-                "reason": "LONG: Trend above EMA200 + RSI recovery + SAR flip",
-            }
-
+    if not best_side:
+        long_s = best_score["score"]
+        short_s = other_score["score"]
         return {
             **base,
-            "signal": "WATCH",
-            "side": "LONG",
-            "reason": f"LONG trend exists | RSI {rsi_now:.1f} | SAR flip={sar_flip_long}",
+            "signal": "NO_TRADE",
+            "score": max(long_s, short_s),
+            "side": None,
+            "reason": f"No clean side | LongScore {long_s}/100 | ShortScore {short_s}/100",
+            "reasons": [],
         }
 
-    # SHORT
-    if trend_short:
-        rsi_recovery = rsi_prev > SHORT_RSI_RECOVERY_LEVEL and rsi_now < SHORT_RSI_RECOVERY_LEVEL
-        not_fomo = rsi_now >= SHORT_RSI_MIN_ENTRY
+    score = best_score["score"]
+    reasons = best_score["reasons"]
+    reason_text = build_reason_text(reasons)
 
-        if rsi_recovery and sar_flip_short and not_fomo:
-            return {
-                **base,
-                "signal": "SHORT",
-                "side": "SHORT",
-                "reason": "SHORT: Trend below EMA200 + RSI recovery + SAR flip",
-            }
+    if score >= ENTRY_SCORE:
+        return {**base, "signal": best_side, "side": best_side, "score": score, "reason": f"Ichimoku Smart Score {score}/100 | {reason_text}", "reasons": reasons}
 
-        return {
-            **base,
-            "signal": "WATCH",
-            "side": "SHORT",
-            "reason": f"SHORT trend exists | RSI {rsi_now:.1f} | SAR flip={sar_flip_short}",
-        }
+    if score >= WATCH_SCORE:
+        return {**base, "signal": "WATCH", "side": best_side, "score": score, "reason": f"{best_side} setup قريب لكن ليس قوي كفاية | Score {score}/100 | {reason_text}", "reasons": reasons}
 
-    return {**base, "signal": "NO_TRADE", "reason": "No EMA200 trend alignment"}
+    return {**base, "signal": "NO_TRADE", "side": best_side, "score": score, "reason": f"Weak setup | Score {score}/100", "reasons": reasons}
 
-# =========================================================
-# 6) PAPER TRADING
-# =========================================================
 
-def calc_position_size(entry: float, sl: float) -> float:
-    balance = safe_float(STATE["balance"], START_BALANCE)
-    risk_amount = balance * risk_pct()
-    risk_per_unit = abs(entry - sl)
-    if risk_per_unit <= 0:
-        return 0.0
-    qty = risk_amount / risk_per_unit
-    return max(qty, 0.0)
+def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float, risk_multiplier: float = 1.0) -> Optional[dict]:
+    entry = snapshot["close_15m"]
+    atr_15m = snapshot["atr_15m"]
+    bars_15m = snapshot["bars_15m"]
+    ichi_15m = snapshot["ichi_15m"]
 
-def create_trade(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    side = signal["side"]
-    entry = safe_float(signal["close"])
-    atr_value = safe_float(signal["atr"])
-
-    if side == "LONG":
-        sl = entry - (atr_value * ATR_SL_MULT)
-        tp1 = entry + (entry - sl) * TP1_R
-        tp2 = entry + (entry - sl) * TP2_R
-    else:
-        sl = entry + (atr_value * ATR_SL_MULT)
-        tp1 = entry - (sl - entry) * TP1_R
-        tp2 = entry - (sl - entry) * TP2_R
-
-    qty = calc_position_size(entry, sl)
-    if qty <= 0:
+    if entry <= 0 or atr_15m <= 0:
         return None
 
-    trade = {
-        "id": f"{signal['symbol']}-{int(time.time())}",
-        "symbol": signal["symbol"],
-        "side": side,
-        "entry": entry,
-        "qty": qty,
-        "sl": sl,
-        "initial_sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp1_done": False,
-        "remaining_pct": 1.0,
-        "opened_at": utc_now(),
-        "status": "open",
-        "reason": signal.get("reason", ""),
-        "risk_pct": risk_pct(),
-        "atr": atr_value,
-        "sar": signal.get("sar"),
-    }
-    STATE["open_trades"].append(trade)
-    save_state()
-    return trade
-
-def pnl_for_trade(trade: Dict[str, Any], exit_price: float, close_pct: float) -> float:
-    side = trade["side"]
-    qty = safe_float(trade["qty"]) * close_pct
-    entry = safe_float(trade["entry"])
     if side == "LONG":
-        return (exit_price - entry) * qty
-    return (entry - exit_price) * qty
-
-def record_closed(trade: Dict[str, Any], exit_price: float, reason: str, close_pct: float) -> float:
-    pnl = pnl_for_trade(trade, exit_price, close_pct)
-    STATE["balance"] = safe_float(STATE["balance"], START_BALANCE) + pnl
-
-    closed = dict(trade)
-    closed.update({
-        "exit": exit_price,
-        "closed_at": utc_now(),
-        "close_reason": reason,
-        "close_pct": close_pct,
-        "pnl": pnl,
-        "pnl_pct_balance": (pnl / max(START_BALANCE, 1)) * 100,
-        "status": "closed",
-    })
-    STATE["closed_trades"].append(closed)
-
-    dkey = today_key()
-    STATE["daily"].setdefault(dkey, {"closed": 0, "wins": 0, "losses": 0, "pnl": 0.0})
-    STATE["daily"][dkey]["closed"] += 1
-    STATE["daily"][dkey]["pnl"] += pnl
-    if pnl >= 0:
-        STATE["daily"][dkey]["wins"] += 1
+        swing_stop = min([b[3] for b in bars_15m[-6:]])
+        cloud_stop = ichi_15m["cloud_bottom"]
+        atr_stop = entry - atr_15m * 1.4
+        stop_loss = min(swing_stop, atr_stop, cloud_stop)
+        risk_per_unit = entry - stop_loss
+        tp1 = entry + risk_per_unit * TP1_R
+        tp2 = entry + risk_per_unit * TP2_R
     else:
-        STATE["daily"][dkey]["losses"] += 1
+        swing_stop = max([b[2] for b in bars_15m[-6:]])
+        cloud_stop = ichi_15m["cloud_top"]
+        atr_stop = entry + atr_15m * 1.4
+        stop_loss = max(swing_stop, atr_stop, cloud_stop)
+        risk_per_unit = stop_loss - entry
+        tp1 = entry - risk_per_unit * TP1_R
+        tp2 = entry - risk_per_unit * TP2_R
 
-    return pnl
+    if risk_per_unit <= 0:
+        return None
 
-async def update_open_trades() -> List[str]:
-    messages = []
-    still_open = []
+    rr_to_tp2 = abs(tp2 - entry) / risk_per_unit
+    if rr_to_tp2 < MIN_RR:
+        return None
 
-    for trade in list(STATE["open_trades"]):
-        symbol = trade["symbol"]
-        candles = await fetch_ohlcv(symbol, TIMEFRAME_ENTRY, limit=260)
-        if not candles:
-            still_open.append(trade)
+    effective_risk = risk_per_trade * risk_multiplier
+    risk_amount = balance * effective_risk
+    raw_amount = risk_amount / risk_per_unit
+    amount = normalize_amount(symbol, raw_amount)
+
+    if amount <= 0:
+        return None
+
+    return {
+        "entry": normalize_price(symbol, entry),
+        "stop_loss": normalize_price(symbol, stop_loss),
+        "tp1": normalize_price(symbol, tp1),
+        "tp2": normalize_price(symbol, tp2),
+        "amount": amount,
+        "risk_amount": risk_amount,
+        "risk_per_unit": risk_per_unit,
+        "effective_risk": effective_risk,
+        "score": snapshot.get("score", 0),
+    }
+
+
+def get_exit_score(symbol: str, side: str) -> Optional[dict]:
+    snapshot = get_market_snapshot(symbol)
+    if not snapshot:
+        return None
+
+    opposite = "SHORT" if side == "LONG" else "LONG"
+    current_score = score_setup(side, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
+    opposite_score = score_setup(opposite, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
+
+    return {
+        "current_score": current_score["score"],
+        "opposite_score": opposite_score["score"],
+        "reason": build_reason_text(current_score["reasons"], limit=3),
+        "close": snapshot["close_15m"],
+        "atr_15m": snapshot["atr_15m"],
+    }
+
+# =========================================================
+# 6) ORDERS / POSITION MANAGEMENT
+# =========================================================
+def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
+    order_side = "buy" if side == "LONG" else "sell"
+    try:
+        leverage = get_current_leverage()
+        set_leverage_and_margin(symbol, leverage)
+
+        order = exchange.create_market_order(
+            symbol,
+            order_side,
+            plan["amount"],
+            params=get_order_params(reduce_only=False),
+        )
+        logger.info(f"{symbol}: opened {side} -> {order.get('id')}")
+
+        trade_state[symbol] = {
+            "symbol": symbol,
+            "side": side,
+            "entry": plan["entry"],
+            "stop_loss": plan["stop_loss"],
+            "tp1": plan["tp1"],
+            "tp2": plan["tp2"],
+            "amount": plan["amount"],
+            "tp1_taken": False,
+            "tp2_taken": False,
+            "trailing_active": False,
+            "trailing_stop": None,
+            "opened_at": now_ts(),
+            "entry_score": snapshot.get("score", 0),
+            "entry_reason": snapshot.get("reason", ""),
+            "mode": BOT_MODE,
+            "leverage": leverage,
+            "order_id": order.get("id"),
+        }
+        save_runtime_state()
+        append_journal("OPEN", {
+            "symbol": symbol,
+            "side": side,
+            "entry": plan["entry"],
+            "stop_loss": plan["stop_loss"],
+            "tp1": plan["tp1"],
+            "tp2": plan["tp2"],
+            "amount": plan["amount"],
+            "risk_pct": plan["effective_risk"] * 100,
+            "score": snapshot.get("score", 0),
+            "mode": BOT_MODE,
+            "leverage": leverage,
+        })
+        return True
+    except Exception as e:
+        logger.error(f"{symbol}: open position error: {e}")
+        append_journal("OPEN_FAILED", {"symbol": symbol, "side": side, "error": str(e)})
+        return False
+
+
+def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
+    """
+    Safer BingX close function.
+    Important fix:
+    - Always refresh the live position from BingX before closing.
+    - This avoids CLOSE_FAILED caused by stale contracts after TP1/TP2/manual actions.
+    - Tries reduceOnly with BOTH first, then reduceOnly only.
+    """
+    try:
+        # Always use the latest position from the exchange right before closing.
+        live_position = get_symbol_position(symbol)
+        if live_position:
+            position = live_position
+
+        contracts = abs(safe_float(position.get("contracts", 0)))
+        if contracts <= 0:
+            append_journal("CLOSE_SKIPPED", {
+                "symbol": symbol,
+                "portion": portion,
+                "reason": "No live contracts found",
+            })
+            return False
+
+        portion = max(0.0, min(1.0, safe_float(portion, 1.0)))
+        raw_amount = contracts if portion >= 0.999 else contracts * portion
+        amount = normalize_amount(symbol, raw_amount)
+        if amount <= 0:
+            append_journal("CLOSE_SKIPPED", {
+                "symbol": symbol,
+                "portion": portion,
+                "contracts": contracts,
+                "reason": "Normalized amount <= 0",
+            })
+            return False
+
+        side = str(position.get("side", "")).lower()
+        if side not in ("long", "short"):
+            # Fallback: use contract sign if ccxt returns signed contracts on some exchanges.
+            side = "long" if safe_float(position.get("contracts", 0)) > 0 else "short"
+
+        close_side = "sell" if side == "long" else "buy"
+
+        # BingX/ccxt can be picky with params. Try safest variants first.
+        param_candidates = [
+            {"reduceOnly": True, "positionSide": "BOTH"},
+            {"reduceOnly": True},
+            get_order_params(reduce_only=True),
+        ]
+
+        last_error = None
+        for params in param_candidates:
+            try:
+                order = exchange.create_market_order(
+                    symbol,
+                    close_side,
+                    amount,
+                    params=params,
+                )
+                logger.info(
+                    f"{symbol}: close requested | side={close_side} | amount={amount} | portion={portion} | order={order.get('id')}"
+                )
+                append_journal("CLOSE_REQUESTED", {
+                    "symbol": symbol,
+                    "side": side.upper(),
+                    "portion": portion,
+                    "amount": amount,
+                    "order_id": order.get("id"),
+                    "params": params,
+                })
+                return True
+            except Exception as e:
+                last_error = e
+                logger.warning(f"{symbol}: close attempt failed with params {params}: {e}")
+
+        append_journal("CLOSE_FAILED", {
+            "symbol": symbol,
+            "side": side.upper(),
+            "portion": portion,
+            "contracts": contracts,
+            "amount": amount,
+            "error": str(last_error),
+        })
+        logger.error(f"{symbol}: close position error after retries: {last_error}")
+        return False
+
+    except Exception as e:
+        logger.error(f"{symbol}: close position fatal error: {e}")
+        append_journal("CLOSE_FAILED", {"symbol": symbol, "portion": portion, "error": str(e)})
+        return False
+
+async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: str, reason: str, entry: float, exit_price: float) -> None:
+    pnl_pct = estimate_pnl_pct(entry, exit_price, side)
+    await notify(
+        context,
+        (
+            f"📌 Position Closed\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side}\n"
+            f"Reason: {reason}\n"
+            f"Entry: {format_num(entry, 6)}\n"
+            f"Exit: {format_num(exit_price, 6)}\n"
+            f"PnL% تقريبي: {format_num(pnl_pct, 2)}%"
+        )
+    )
+
+
+async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
+    positions = fetch_positions()
+    if not positions:
+        return
+
+    for pos in positions:
+        contracts = safe_float(pos.get("contracts", 0))
+        if contracts == 0:
             continue
 
-        h, l, c, v = candles_to_arrays(candles)
-        close = c[-1]
-        sar_now = parabolic_sar(h, l, SAR_STEP, SAR_MAX)[-1]
+        symbol = pos["symbol"]
+        entry_price = safe_float(pos.get("entryPrice", 0))
+        mark_price = safe_float(pos.get("markPrice", 0))
+        side_raw = str(pos.get("side", "")).lower()
 
-        side = trade["side"]
-        exit_now = False
-        exit_reason = ""
-        exit_price = close
+        if entry_price <= 0 or mark_price <= 0:
+            continue
 
-        # SAR trailing stop update
-        if sar_now:
-            if side == "LONG":
-                trade["sl"] = max(safe_float(trade["sl"]), safe_float(sar_now))
-            else:
-                trade["sl"] = min(safe_float(trade["sl"]), safe_float(sar_now))
+        side = "LONG" if side_raw == "long" else "SHORT"
 
-        # TP1 partial close
-        if not trade.get("tp1_done"):
-            if side == "LONG" and close >= trade["tp1"]:
-                pnl = record_closed(trade, trade["tp1"], "TP1 partial", TP1_CLOSE_PCT)
-                trade["tp1_done"] = True
-                trade["remaining_pct"] = 1.0 - TP1_CLOSE_PCT
-                trade["sl"] = trade["entry"]  # breakeven after TP1
-                messages.append(f"✅ TP1 LONG {symbol}\nClosed 50% | PnL: {pnl:.3f} USDT\nSL moved to breakeven")
-            elif side == "SHORT" and close <= trade["tp1"]:
-                pnl = record_closed(trade, trade["tp1"], "TP1 partial", TP1_CLOSE_PCT)
-                trade["tp1_done"] = True
-                trade["remaining_pct"] = 1.0 - TP1_CLOSE_PCT
-                trade["sl"] = trade["entry"]
-                messages.append(f"✅ TP1 SHORT {symbol}\nClosed 50% | PnL: {pnl:.3f} USDT\nSL moved to breakeven")
+        state = trade_state.get(symbol)
+        if not state:
+            fallback_sl = entry_price * (0.985 if side == "LONG" else 1.015)
+            fallback_tp1 = entry_price * (1.009 if side == "LONG" else 0.991)
+            fallback_tp2 = entry_price * (1.018 if side == "LONG" else 0.982)
+            trade_state[symbol] = {
+                "symbol": symbol,
+                "side": side,
+                "entry": entry_price,
+                "stop_loss": fallback_sl,
+                "tp1": fallback_tp1,
+                "tp2": fallback_tp2,
+                "amount": contracts,
+                "tp1_taken": False,
+                "tp2_taken": False,
+                "trailing_active": False,
+                "trailing_stop": None,
+                "opened_at": now_ts(),
+                "entry_score": 0,
+                "entry_reason": "Recovered open position",
+                "mode": BOT_MODE,
+                "leverage": get_current_leverage(),
+            }
+            state = trade_state[symbol]
+            save_runtime_state()
+            append_journal("RECOVER_POSITION", {"symbol": symbol, "side": side, "entry": entry_price, "contracts": contracts})
 
-        # TP2 full close
-        if side == "LONG" and close >= trade["tp2"]:
-            exit_now = True
-            exit_price = trade["tp2"]
-            exit_reason = "TP2"
-        elif side == "SHORT" and close <= trade["tp2"]:
-            exit_now = True
-            exit_price = trade["tp2"]
-            exit_reason = "TP2"
+        bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
+        if not bars_15m:
+            continue
+        atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
+        if atr_15m is None:
+            continue
 
-        # SL / trailing
-        if not exit_now:
-            if side == "LONG" and close <= trade["sl"]:
-                exit_now = True
-                exit_price = trade["sl"]
-                exit_reason = "SL / Trailing SAR"
-            elif side == "SHORT" and close >= trade["sl"]:
-                exit_now = True
-                exit_price = trade["sl"]
-                exit_reason = "SL / Trailing SAR"
+        exit_info = get_exit_score(symbol, side)
+        current_score = exit_info["current_score"] if exit_info else 100
+        opposite_score = exit_info["opposite_score"] if exit_info else 0
 
-        if exit_now:
-            close_pct = safe_float(trade.get("remaining_pct", 1.0), 1.0)
-            pnl = record_closed(trade, exit_price, exit_reason, close_pct)
-            messages.append(
-                f"🔚 Closed {side} {symbol}\n"
-                f"Reason: {exit_reason}\n"
-                f"Exit: {exit_price:.6f}\n"
-                f"PnL: {pnl:.3f} USDT\n"
-                f"Balance: {STATE['balance']:.2f} USDT"
-            )
+        if side == "LONG":
+            if mark_price <= safe_float(state["stop_loss"]):
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
+                    await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
+            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
+                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
+            if (not state.get("tp1_taken")) and mark_price >= safe_float(state["tp1"]):
+                if close_position(symbol, pos, 0.5):
+                    state["tp1_taken"] = True
+                    state["stop_loss"] = state["entry"]
+                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
+                    save_runtime_state()
+                    await notify(context, f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
+                    continue
+
+            refreshed = get_symbol_position(symbol) or pos
+            if (not state.get("tp2_taken")) and mark_price >= safe_float(state["tp2"]):
+                if close_position(symbol, refreshed, 0.6):
+                    state["tp2_taken"] = True
+                    state["trailing_active"] = True
+                    state["trailing_stop"] = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
+                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
+                    save_runtime_state()
+                    await notify(context, f"🚀 TP2 LONG\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
+                    continue
+
+            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+                refreshed = get_symbol_position(symbol) or pos
+                if close_position(symbol, refreshed, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
+                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
+            if state.get("trailing_active"):
+                new_trailing = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
+                if state.get("trailing_stop") is None:
+                    state["trailing_stop"] = new_trailing
+                else:
+                    state["trailing_stop"] = max(safe_float(state["trailing_stop"]), new_trailing)
+                save_runtime_state()
+
+                if mark_price <= safe_float(state["trailing_stop"]):
+                    refreshed = get_symbol_position(symbol) or pos
+                    if close_position(symbol, refreshed, 1.0):
+                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
+                        await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
+                        trade_state.pop(symbol, None)
+                        set_cooldown(symbol)
+                    continue
+
         else:
-            still_open.append(trade)
+            if mark_price >= safe_float(state["stop_loss"]):
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
+                    await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
 
-    STATE["open_trades"] = still_open
-    save_state()
-    return messages
+            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
+                if close_position(symbol, pos, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
+                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
+            if (not state.get("tp1_taken")) and mark_price <= safe_float(state["tp1"]):
+                if close_position(symbol, pos, 0.5):
+                    state["tp1_taken"] = True
+                    state["stop_loss"] = state["entry"]
+                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
+                    save_runtime_state()
+                    await notify(context, f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
+                    continue
+
+            refreshed = get_symbol_position(symbol) or pos
+            if (not state.get("tp2_taken")) and mark_price <= safe_float(state["tp2"]):
+                if close_position(symbol, refreshed, 0.6):
+                    state["tp2_taken"] = True
+                    state["trailing_active"] = True
+                    state["trailing_stop"] = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
+                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
+                    save_runtime_state()
+                    await notify(context, f"🚀 TP2 SHORT\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
+                    continue
+
+            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+                refreshed = get_symbol_position(symbol) or pos
+                if close_position(symbol, refreshed, 1.0):
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
+                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
+                    trade_state.pop(symbol, None)
+                    set_cooldown(symbol)
+                continue
+
+            if state.get("trailing_active"):
+                new_trailing = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
+                if state.get("trailing_stop") is None:
+                    state["trailing_stop"] = new_trailing
+                else:
+                    state["trailing_stop"] = min(safe_float(state["trailing_stop"]), new_trailing)
+                save_runtime_state()
+
+                if mark_price >= safe_float(state["trailing_stop"]):
+                    refreshed = get_symbol_position(symbol) or pos
+                    if close_position(symbol, refreshed, 1.0):
+                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
+                        await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
+                        trade_state.pop(symbol, None)
+                        set_cooldown(symbol)
+                    continue
 
 # =========================================================
-# 7) TELEGRAM UI
+# 7) SCAN JOB
 # =========================================================
+async def trading_job(context: ContextTypes.DEFAULT_TYPE):
+    global last_scan_summary, last_signal_summary, bot_paused
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    running = "⏸ إيقاف" if STATE.get("bot_running") else "▶️ تشغيل"
-    risk = "🔥 Aggressive" if STATE.get("risk_mode") == "aggressive" else "🧠 Normal"
+    reset_daily_stats_if_needed()
+
+    if bot_paused:
+        last_scan_summary = "Bot is paused."
+        return
+
+    await manage_open_positions(context)
+
+    if count_open_positions() >= MAX_OPEN_POSITIONS:
+        last_scan_summary = "Max open positions reached."
+        logger.info(last_scan_summary)
+        return
+
+    scan_lines = []
+
+    for symbol in SYMBOLS:
+        try:
+            if is_in_cooldown(symbol):
+                scan_lines.append(f"{symbol}: COOLDOWN")
+                continue
+
+            if get_symbol_position(symbol):
+                scan_lines.append(f"{symbol}: ALREADY_OPEN")
+                continue
+
+            snapshot = get_market_snapshot(symbol)
+            if not snapshot:
+                scan_lines.append(f"{symbol}: NO_DATA")
+                continue
+
+            signal = snapshot["signal"]
+            reason = snapshot["reason"]
+            score = snapshot.get("score", 0)
+
+            scan_lines.append(f"{symbol}: {signal} | Score {score}/100 | {reason}")
+            last_signal_summary = f"{symbol}: {signal} | Score {score}/100 | {reason}"
+
+            if signal not in ("LONG", "SHORT"):
+                continue
+
+            entry_side = signal
+
+            balance = fetch_balance_usdt()
+            if balance <= 5:
+                scan_lines.append(f"{symbol}: LOW_BALANCE")
+                continue
+
+            plan = calculate_trade_plan(symbol, snapshot, entry_side, balance, risk_multiplier=1.0)
+            if not plan:
+                scan_lines.append(f"{symbol}: PLAN_REJECTED")
+                continue
+
+            if open_position(symbol, entry_side, plan, snapshot):
+                await notify(
+                    context,
+                    (
+                        f"🚀 Ichimoku Smart Trade Opened\n"
+                        f"Symbol: {symbol}\n"
+                        f"Side: {entry_side}\n"
+                        f"SmartScore: {score}/100\n"
+                        f"Reason: {reason}\n"
+                        f"Entry: {format_num(plan['entry'], 6)}\n"
+                        f"SL: {format_num(plan['stop_loss'], 6)}\n"
+                        f"TP1: {format_num(plan['tp1'], 6)}\n"
+                        f"TP2: {format_num(plan['tp2'], 6)}\n"
+                        f"Amount: {plan['amount']}\n"
+                        f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%\n"
+                        f"Mode: {BOT_MODE}\n"
+                        f"Leverage: {get_current_leverage()}x"
+                    )
+                )
+                scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
+                if count_open_positions() >= MAX_OPEN_POSITIONS:
+                    break
+            else:
+                scan_lines.append(f"{symbol}: OPEN_FAILED")
+
+        except Exception as e:
+            logger.error(f"{symbol}: trading_job error: {e}")
+            scan_lines.append(f"{symbol}: ERROR")
+
+    last_scan_summary = "\n".join(scan_lines[-12:]) if scan_lines else "No scan results."
+    logger.info(f"Scan summary:\n{last_scan_summary}")
+
+# =========================================================
+# 8) TELEGRAM DASHBOARD
+# =========================================================
+def dashboard_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💰 الرصيد", callback_data="balance"),
-            InlineKeyboardButton("📁 الصفقات", callback_data="trades"),
+            InlineKeyboardButton("💰 الرصيد", callback_data="dash_balance"),
+            InlineKeyboardButton("📡 الرادار", callback_data="dash_radar"),
         ],
         [
-            InlineKeyboardButton("📡 الرادار", callback_data="radar"),
-            InlineKeyboardButton(running, callback_data="toggle_running"),
+            InlineKeyboardButton("🧠 Normal 3x", callback_data="mode_normal"),
+            InlineKeyboardButton("🔥 Aggressive 5x", callback_data="mode_aggressive"),
         ],
         [
-            InlineKeyboardButton(risk, callback_data="toggle_risk"),
-            InlineKeyboardButton("📊 الإحصائيات", callback_data="stats"),
+            InlineKeyboardButton("📂 الصفقات", callback_data="dash_positions"),
+            InlineKeyboardButton("📈 اليوم", callback_data="dash_stats"),
         ],
         [
-            InlineKeyboardButton("✅ إغلاق الرابحة", callback_data="close_winners"),
-            InlineKeyboardButton("❌ إغلاق الخاسرة", callback_data="close_losers"),
+            InlineKeyboardButton("📊 الكل", callback_data="dash_allstats"),
+            InlineKeyboardButton("📒 السجل", callback_data="dash_journal"),
         ],
         [
-            InlineKeyboardButton("🛑 إغلاق الكل", callback_data="close_all"),
-            InlineKeyboardButton("🚨 طوارئ", callback_data="emergency"),
+            InlineKeyboardButton("🏆 الأفضل", callback_data="dash_best"),
+            InlineKeyboardButton("🔎 فحص يدوي", callback_data="dash_scan"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ المخاطرة", callback_data="dash_risk_menu"),
+        ],
+        [
+            InlineKeyboardButton("⏸ إيقاف", callback_data="dash_pause"),
+            InlineKeyboardButton("▶️ تشغيل", callback_data="dash_resume"),
+        ],
+        [
+            InlineKeyboardButton("🛑 إغلاق الكل", callback_data="dash_close_all"),
+            InlineKeyboardButton("✅ إغلاق الرابحة", callback_data="dash_close_winners"),
+        ],
+        [
+            InlineKeyboardButton("❌ إغلاق الخاسرة", callback_data="dash_close_losers"),
         ],
     ])
 
-def dashboard_text() -> str:
-    return (
-        "🤖 SAR Pro Paper Bot\n"
-        "━━━━━━━━━━━━━━\n"
-        f"الاستراتيجية: Trend Pullback + SAR\n"
-        f"المصدر: OKX\n"
-        f"الوضع: {'شغال ✅' if STATE.get('bot_running') else 'متوقف ⏸'}\n"
-        f"الطوارئ: {'مفعلة 🚨' if STATE.get('emergency_stop') else 'غير مفعلة ✅'}\n"
-        f"المخاطرة: {STATE.get('risk_mode')} ({risk_pct()*100:.2f}%)\n"
-        f"الرصيد: {safe_float(STATE.get('balance')):.2f} USDT\n"
-        f"الصفقات المفتوحة: {len(STATE.get('open_trades', []))}\n"
-    )
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(dashboard_text(), reply_markup=main_keyboard())
+def risk_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("0.3%", callback_data="risk_0.003"), InlineKeyboardButton("0.5%", callback_data="risk_0.005")],
+        [InlineKeyboardButton("0.6%", callback_data="risk_0.006"), InlineKeyboardButton("0.75%", callback_data="risk_0.0075")],
+        [InlineKeyboardButton("1.0%", callback_data="risk_0.01"), InlineKeyboardButton("⬅️ رجوع", callback_data="dash_home")],
+    ])
 
-async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(dashboard_text(), reply_markup=main_keyboard())
 
-def open_trades_text() -> str:
-    trades = STATE.get("open_trades", [])
-    if not trades:
-        return "لا توجد صفقات مفتوحة حالياً."
-    lines = ["📁 الصفقات المفتوحة:"]
-    for t in trades:
-        lines.append(
-            f"\n{t['side']} {t['symbol']}\n"
-            f"Entry: {t['entry']:.6f}\n"
-            f"SL: {t['sl']:.6f}\n"
-            f"TP1: {t['tp1']:.6f} | TP2: {t['tp2']:.6f}\n"
-            f"Remaining: {t.get('remaining_pct', 1.0)*100:.0f}%"
-        )
-    return "\n".join(lines)
-
-def stats_text() -> str:
-    closed = STATE.get("closed_trades", [])
-    if not closed:
-        return "📊 لا توجد صفقات مغلقة حتى الآن."
-
-    wins = [t for t in closed if safe_float(t.get("pnl")) >= 0]
-    losses = [t for t in closed if safe_float(t.get("pnl")) < 0]
-    total_pnl = sum(safe_float(t.get("pnl")) for t in closed)
-    winrate = (len(wins) / len(closed)) * 100 if closed else 0
-    best = max([safe_float(t.get("pnl")) for t in closed], default=0)
-    worst = min([safe_float(t.get("pnl")) for t in closed], default=0)
-
-    d = STATE.get("daily", {}).get(today_key(), {"closed": 0, "wins": 0, "losses": 0, "pnl": 0.0})
-
-    return (
-        "📊 الإحصائيات\n"
-        "━━━━━━━━━━━━━━\n"
-        f"إجمالي الصفقات المغلقة: {len(closed)}\n"
-        f"الرابحة: {len(wins)} | الخاسرة: {len(losses)}\n"
-        f"نسبة النجاح: {winrate:.2f}%\n"
-        f"إجمالي PnL: {total_pnl:.3f} USDT\n"
-        f"أفضل صفقة: {best:.3f}\n"
-        f"أسوأ صفقة: {worst:.3f}\n\n"
-        f"اليوم {today_key()}:\n"
-        f"مغلقة: {d['closed']} | ربح: {d['wins']} | خسارة: {d['losses']} | PnL: {d['pnl']:.3f}"
-    )
-
-def radar_text() -> str:
-    scan = STATE.get("last_scan", {})
-    if not scan:
-        return "📡 لا يوجد فحص حتى الآن."
-    lines = ["📡 آخر فحص:"]
-    for sym, item in scan.items():
-        lines.append(f"{sym}: {item.get('signal')} | {item.get('reason')}")
-    return "\n".join(lines)
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "balance":
-        text = f"💰 الرصيد الحالي: {safe_float(STATE.get('balance')):.2f} USDT"
-    elif data == "trades":
-        text = open_trades_text()
-    elif data == "stats":
-        text = stats_text()
-    elif data == "radar":
-        text = radar_text()
-    elif data == "toggle_running":
-        STATE["bot_running"] = not STATE.get("bot_running", True)
-        save_state()
-        text = dashboard_text()
-    elif data == "toggle_risk":
-        STATE["risk_mode"] = "aggressive" if STATE.get("risk_mode") == "normal" else "normal"
-        save_state()
-        text = dashboard_text()
-    elif data == "emergency":
-        STATE["emergency_stop"] = True
-        STATE["bot_running"] = False
-        save_state()
-        text = "🚨 تم تفعيل وضع الطوارئ. البوت توقف ولن يفتح صفقات جديدة."
-    elif data in ("close_all", "close_winners", "close_losers"):
-        text = await manual_close(data)
-    else:
-        text = dashboard_text()
-
-    await q.edit_message_text(text, reply_markup=main_keyboard())
-
-async def manual_close(mode: str) -> str:
-    if not STATE["open_trades"]:
-        return "لا توجد صفقات مفتوحة."
-
-    remaining = []
-    closed_count = 0
-    total_pnl = 0.0
-
-    for trade in STATE["open_trades"]:
-        candles = await fetch_ohlcv(trade["symbol"], TIMEFRAME_ENTRY, limit=50)
-        if not candles:
-            remaining.append(trade)
+async def show_positions(message_target, positions: List[dict]):
+    lines = []
+    for p in positions:
+        contracts = safe_float(p.get("contracts", 0))
+        if contracts == 0:
             continue
-        close = safe_float(candles[-1][4])
-        pnl_now = pnl_for_trade(trade, close, safe_float(trade.get("remaining_pct", 1.0), 1.0))
+        symbol = p["symbol"]
+        state = trade_state.get(symbol, {})
+        extra = ""
+        if state:
+            extra = (
+                f"\nSL: {format_num(safe_float(state.get('stop_loss', 0)), 6)}"
+                f" | TP1: {format_num(safe_float(state.get('tp1', 0)), 6)}"
+                f" | TP2: {format_num(safe_float(state.get('tp2', 0)), 6)}"
+                f" | TP1 taken: {state.get('tp1_taken', False)}"
+                f" | TP2 taken: {state.get('tp2_taken', False)}"
+                f" | Trail: {format_num(safe_float(state.get('trailing_stop', 0)), 6) if state.get('trailing_stop') else '-'}"
+            )
+        lines.append(
+            f"{symbol} | {p.get('side')} | Contracts: {contracts}\n"
+            f"Entry: {format_num(safe_float(p.get('entryPrice', 0)), 6)} | "
+            f"Mark: {format_num(safe_float(p.get('markPrice', 0)), 6)} | "
+            f"UPnL: {format_num(safe_float(p.get('unrealizedPnl', 0)), 4)}"
+            f"{extra}"
+        )
+    if not lines:
+        await message_target.reply_text("لا توجد صفقات مفتوحة.")
+    else:
+        await message_target.reply_text("📂 الصفقات المفتوحة:\n\n" + "\n\n".join(lines[:20]))
+
+
+async def close_by_pnl(update_or_message, mode: str):
+    positions = fetch_positions()
+    count = 0
+
+    for p in positions:
+        contracts = safe_float(p.get("contracts", 0))
+        if contracts == 0:
+            continue
+
+        upnl = safe_float(p.get("unrealizedPnl", 0))
+        symbol = p["symbol"]
+        entry_price = safe_float(p.get("entryPrice", 0))
+        mark_price = safe_float(p.get("markPrice", 0))
+        side_raw = str(p.get("side", "")).lower()
+        side = "LONG" if side_raw == "long" else "SHORT"
 
         should_close = (
-            mode == "close_all" or
-            (mode == "close_winners" and pnl_now > 0) or
-            (mode == "close_losers" and pnl_now < 0)
+            (mode == "all") or
+            (mode == "winners" and upnl > 0) or
+            (mode == "losers" and upnl < 0)
         )
 
-        if should_close:
-            pnl = record_closed(trade, close, "Manual close", safe_float(trade.get("remaining_pct", 1.0), 1.0))
-            total_pnl += pnl
-            closed_count += 1
-        else:
-            remaining.append(trade)
+        if not should_close:
+            continue
 
-    STATE["open_trades"] = remaining
-    save_state()
-    return f"تم إغلاق {closed_count} صفقة.\nPnL: {total_pnl:.3f} USDT\nBalance: {STATE['balance']:.2f} USDT"
+        if close_position(symbol, p, 1.0):
+            record_closed_trade(symbol, entry_price, mark_price, side, f"Manual close {mode}")
+            trade_state.pop(symbol, None)
+            set_cooldown(symbol)
+            count += 1
+
+    if mode == "all":
+        msg = f"🛑 تم طلب إغلاق {count} صفقة."
+    elif mode == "winners":
+        msg = f"✅ تم طلب إغلاق {count} صفقة رابحة."
+    else:
+        msg = f"❌ تم طلب إغلاق {count} صفقة خاسرة."
+
+    await update_or_message.reply_text(msg)
 
 # =========================================================
-# 8) SCANNER JOB
+# 9) COMMANDS
 # =========================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat:
+        context.bot_data["chat_id"] = str(update.effective_chat.id)
+    await update.message.reply_text("🤖 Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:", reply_markup=dashboard_kb())
 
-async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
-    chat_id = ENV_CHAT_ID
-    if not chat_id:
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    paused = "نعم" if bot_paused else "لا"
+    b = fetch_balance_details()
+    await update.message.reply_text(
+        f"📊 الحالة\n"
+        f"الوضع: {get_mode_text()}\n"
+        f"الاستراتيجية: Ichimoku Smart Score\n"
+        f"متوقف: {paused}\n"
+        f"Available: {b['free']:.2f} USDT\n"
+        f"Used Margin: {b['used']:.2f} USDT\n"
+        f"Wallet Total: {b['total']:.2f} USDT\n"
+        f"Open PnL: {b['unrealized_pnl']:.4f} USDT\n"
+        f"Estimated Equity: {b['equity_est']:.2f} USDT\n"
+        f"الصفقات المفتوحة: {count_open_positions()}/{MAX_OPEN_POSITIONS}\n"
+        f"المخاطرة الحالية: {risk_per_trade * 100:.2f}%\n"
+        f"نقطة الدخول: {ENTRY_SCORE}/100\n"
+        f"DATA_DIR: {DATA_DIR}\n"
+        f"آخر إشارة: {last_signal_summary}\n\n"
+        f"آخر فحص:\n{last_scan_summary}",
+        reply_markup=dashboard_kb(),
+    )
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_balance_text())
+
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_positions(update.message, fetch_positions())
+
+
+async def cmd_radar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_paused
+    bot_paused = True
+    await update.message.reply_text("⏸ تم إيقاف البوت.")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_paused
+    bot_paused = False
+    await update.message.reply_text("▶️ تم تشغيل البوت.")
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔎 جاري الفحص اليدوي...")
+    await trading_job(context)
+    await update.message.reply_text(f"تم.\n\n{last_scan_summary}")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_today_stats_text())
+
+
+async def cmd_allstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_all_stats_text())
+
+
+async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_best_symbols_text())
+
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_journal_text(12))
+
+
+async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await close_by_pnl(update.message, "all")
+
+# =========================================================
+# 10) CALLBACKS
+# =========================================================
+async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_paused, risk_per_trade, BOT_MODE
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "dash_home":
+        await query.message.reply_text("🎛 لوحة التحكم:", reply_markup=dashboard_kb())
+
+    elif data == "mode_normal":
+        BOT_MODE = "NORMAL"
+        await query.message.reply_text("🧠 تم تفعيل الوضع العادي NORMAL (3x)")
+
+    elif data == "mode_aggressive":
+        BOT_MODE = "AGGRESSIVE"
+        await query.message.reply_text("🔥 تم تفعيل الوضع الهجومي AGGRESSIVE (5x)")
+
+    elif data == "dash_balance":
+        await query.message.reply_text(build_balance_text())
+
+    elif data == "dash_radar":
+        await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
+
+    elif data == "dash_positions":
+        await show_positions(query.message, fetch_positions())
+
+    elif data == "dash_stats":
+        await query.message.reply_text(build_today_stats_text())
+
+    elif data == "dash_allstats":
+        await query.message.reply_text(build_all_stats_text())
+
+    elif data == "dash_journal":
+        await query.message.reply_text(build_journal_text(12))
+
+    elif data == "dash_best":
+        await query.message.reply_text(build_best_symbols_text())
+
+    elif data == "dash_scan":
+        await query.message.reply_text("🔎 جاري الفحص اليدوي...")
+        await trading_job(context)
+        await query.message.reply_text(f"تم.\n\n{last_scan_summary}")
+
+    elif data == "dash_pause":
+        bot_paused = True
+        await query.message.reply_text("⏸ تم إيقاف البوت.")
+
+    elif data == "dash_resume":
+        bot_paused = False
+        await query.message.reply_text("▶️ تم تشغيل البوت.")
+
+    elif data == "dash_risk_menu":
+        await query.message.reply_text(f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%", reply_markup=risk_kb())
+
+    elif data.startswith("risk_"):
+        try:
+            risk_per_trade = float(data.split("_", 1)[1])
+            await query.message.reply_text(f"✅ تم تغيير المخاطرة إلى {risk_per_trade * 100:.2f}%")
+        except Exception:
+            await query.message.reply_text("❌ فشل تغيير المخاطرة.")
+
+    elif data == "dash_close_all":
+        await close_by_pnl(query.message, "all")
+
+    elif data == "dash_close_winners":
+        await close_by_pnl(query.message, "winners")
+
+    elif data == "dash_close_losers":
+        await close_by_pnl(query.message, "losers")
+
+# =========================================================
+# 11) HEALTH
+# =========================================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ICHIMOKU_SMART_BOT_LIVE")
+
+    def log_message(self, format, *args):
         return
-    try:
-        await context.bot.send_message(chat_id=int(chat_id), text=text)
-    except Exception as e:
-        logger.warning(f"Telegram notify failed: {e}")
-
-async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    # Always manage open trades even if bot is paused
-    close_messages = await update_open_trades()
-    for msg in close_messages:
-        await notify(context, msg)
-
-    if not STATE.get("bot_running", True) or STATE.get("emergency_stop", False):
-        return
-
-    scan_result = {}
-    for symbol in SYMBOLS:
-        signal = await build_signal(symbol)
-        scan_result[symbol] = {
-            "signal": signal.get("signal"),
-            "reason": signal.get("reason"),
-            "time": utc_now(),
-        }
-
-        if signal.get("signal") in ("LONG", "SHORT"):
-            trade = create_trade(signal)
-            if trade:
-                await notify(
-                    context,
-                    f"🚀 New {trade['side']} Paper Trade\n"
-                    f"{trade['symbol']}\n"
-                    f"Entry: {trade['entry']:.6f}\n"
-                    f"SL: {trade['sl']:.6f}\n"
-                    f"TP1: {trade['tp1']:.6f}\n"
-                    f"TP2: {trade['tp2']:.6f}\n"
-                    f"Risk: {trade['risk_pct']*100:.2f}%\n"
-                    f"Reason: {trade['reason']}"
-                )
-
-        await asyncio.sleep(0.2)
-
-    STATE["last_scan"] = scan_result
-    save_state()
 
 # =========================================================
-# 9) MAIN
+# 12) MAIN
 # =========================================================
-
 def main():
+    load_stats_from_disk()
+    load_runtime_state()
+
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = ApplicationBuilder().token(TOKEN).build()
 
+    if app.job_queue is None:
+        raise RuntimeError('JobQueue unavailable. Install "python-telegram-bot[job-queue]".')
+
+    if ENV_CHAT_ID:
+        app.bot_data["chat_id"] = str(ENV_CHAT_ID)
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("radar", cmd_radar))
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("allstats", cmd_allstats))
+    app.add_handler(CommandHandler("best", cmd_best))
+    app.add_handler(CommandHandler("journal", cmd_journal))
+    app.add_handler(CommandHandler("closeall", cmd_close_all))
+    app.add_handler(CallbackQueryHandler(dashboard_handler))
 
-    app.job_queue.run_repeating(scan_job, interval=SCAN_SECONDS, first=5)
+    app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
+    app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
 
-    logger.info("Starting SAR Pro Paper Bot on OKX...")
-    app.run_polling(close_loop=False)
+    logger.info(f"Starting Ichimoku Smart Bot... DATA_DIR={DATA_DIR}")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
