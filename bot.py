@@ -32,12 +32,21 @@ if not TOKEN:
 if not BINGX_API_KEY or not BINGX_SECRET:
     raise RuntimeError("Missing BINGX_API_KEY or BINGX_SECRET")
 
+# IMPORTANT FOR RENDER:
+# Add Persistent Disk and set DATA_DIR=/data
+# If DATA_DIR is not set, files will be saved in the current project folder and may reset after deploy.
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "stats.json"
+JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
+STATE_FILE = DATA_DIR / "trade_state.json"
+COOLDOWNS_FILE = DATA_DIR / "cooldowns.json"
+
 # BingX Perpetual USDT-M
 MARGIN_MODE = "isolated"
 
 # Mode system
-# NORMAL = current safer mode with 3x leverage
-# AGGRESSIVE = higher leverage mode with 5x leverage only
 BOT_MODE = os.getenv("BOT_MODE", "NORMAL").upper()
 if BOT_MODE not in ("NORMAL", "AGGRESSIVE"):
     BOT_MODE = "NORMAL"
@@ -58,7 +67,6 @@ SYMBOLS = [
     "AVAX/USDT:USDT",
     "LTC/USDT:USDT",
     "TRX/USDT:USDT",
-     
     "ATOM/USDT:USDT",
     "NEAR/USDT:USDT",
 ]
@@ -90,9 +98,9 @@ WATCH_SCORE = 70
 MIN_RR = 1.35
 
 # Entry filters
-MAX_DISTANCE_FROM_KIJUN_15M = 0.018  # 1.8%
-MAX_ATR_PERCENT_15M = 0.035          # avoid crazy volatility
-MIN_ATR_PERCENT_15M = 0.0015         # avoid dead market
+MAX_DISTANCE_FROM_KIJUN_15M = 0.018
+MAX_ATR_PERCENT_15M = 0.035
+MIN_ATR_PERCENT_15M = 0.0015
 
 # Exit logic
 TP1_R = 0.9
@@ -103,9 +111,6 @@ EMERGENCY_EXIT_SCORE = 35
 
 SCAN_INTERVAL_SECONDS = 60
 POSITION_CHECK_INTERVAL_SECONDS = 20
-
-# Persistent stats file
-STATS_FILE = Path("stats.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,12 +146,18 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def utc_today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
 def safe_float(value, default: float = 0.0) -> float:
     try:
+        if value is None:
+            return default
         return float(value)
     except Exception:
         return default
@@ -187,11 +198,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 def is_in_cooldown(symbol: str) -> bool:
-    return now_ts() < cooldowns.get(symbol, 0)
+    return now_ts() < int(cooldowns.get(symbol, 0))
 
 
 def set_cooldown(symbol: str) -> None:
     cooldowns[symbol] = now_ts() + COOLDOWN_MINUTES * 60
+    save_runtime_state()
 
 
 def sma(values: List[float], period: int) -> Optional[float]:
@@ -271,9 +283,85 @@ def normalize_price(symbol: str, price: float) -> float:
     except Exception:
         return price
 
+# =========================================================
+# 3.1) PERSISTENT RUNTIME STATE + JOURNAL
+# =========================================================
+def append_journal(event_type: str, payload: dict) -> None:
+    """Append every important trade event to JSONL so deploys do not erase history."""
+    try:
+        row = {
+            "ts": utc_now_iso(),
+            "event": event_type,
+            **payload,
+        }
+        with JOURNAL_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"append_journal error: {e}")
+
+
+def save_runtime_state() -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(trade_state, ensure_ascii=False, indent=2), encoding="utf-8")
+        COOLDOWNS_FILE.write_text(json.dumps(cooldowns, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save_runtime_state error: {e}")
+
+
+def load_runtime_state() -> None:
+    global trade_state, cooldowns
+    try:
+        if STATE_FILE.exists():
+            trade_state = json.loads(STATE_FILE.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.error(f"load trade_state error: {e}")
+        trade_state = {}
+
+    try:
+        if COOLDOWNS_FILE.exists():
+            cooldowns = json.loads(COOLDOWNS_FILE.read_text(encoding="utf-8")) or {}
+            cooldowns = {str(k): int(v) for k, v in cooldowns.items()}
+    except Exception as e:
+        logger.error(f"load cooldowns error: {e}")
+        cooldowns = {}
+
+
+def get_recent_journal_lines(limit: int = 10) -> List[dict]:
+    try:
+        if not JOURNAL_FILE.exists():
+            return []
+        lines = JOURNAL_FILE.read_text(encoding="utf-8").splitlines()
+        rows = []
+        for line in lines[-limit:]:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        return rows
+    except Exception as e:
+        logger.error(f"get_recent_journal_lines error: {e}")
+        return []
+
+
+def build_journal_text(limit: int = 10) -> str:
+    rows = get_recent_journal_lines(limit)
+    if not rows:
+        return "📒 لا يوجد سجل صفقات محفوظ حتى الآن."
+
+    lines = [f"📒 آخر {len(rows)} أحداث في سجل الصفقات:"]
+    for r in rows:
+        ts = str(r.get("ts", ""))[:19]
+        event = r.get("event", "-")
+        symbol = r.get("symbol", "-")
+        side = r.get("side", "-")
+        reason = r.get("reason", r.get("stage", ""))
+        pnl = r.get("pnl_pct")
+        pnl_text = f" | PnL {safe_float(pnl):.2f}%" if pnl is not None else ""
+        lines.append(f"{ts} | {event} | {symbol} | {side} | {reason}{pnl_text}")
+    return "\n".join(lines)
 
 # =========================================================
-# 3.1) ICHIMOKU HELPERS
+# 3.2) ICHIMOKU HELPERS
 # =========================================================
 def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> Optional[float]:
     start = end_index - period + 1
@@ -286,10 +374,6 @@ def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> 
 
 
 def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
-    """
-    Practical Ichimoku snapshot for bot decisions.
-    For current cloud, we compare price with the cloud values projected from 26 candles ago.
-    """
     required = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 5
     if len(ohlcv) < required:
         return None
@@ -312,7 +396,6 @@ def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
     cloud_bottom = min(span_a_current, span_b_current)
     close = ohlcv[-1][4]
 
-    # Future cloud from current candle.
     span_a_future = (tenkan_now + kijun_now) / 2
     span_b_future = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, last)
     if span_b_future is None:
@@ -415,7 +498,6 @@ def score_setup(
     want = "BULL" if side == "LONG" else "BEAR"
     cloud_side = "ABOVE" if side == "LONG" else "BELOW"
 
-    # 4H macro direction
     if trend_4h == want:
         score += 25
         reasons.append(f"4H {want} فوق/تحت السحابة بشكل واضح")
@@ -429,7 +511,6 @@ def score_setup(
         score -= 35
         reasons.append("4H ضد اتجاه الصفقة")
 
-    # 1H confirmation
     if trend_1h == want:
         score += 20
         reasons.append(f"1H يؤكد الاتجاه {want}")
@@ -443,7 +524,6 @@ def score_setup(
         score -= 25
         reasons.append("1H ضد الصفقة")
 
-    # 15m entry condition
     if trend_15m == want:
         score += 15
         reasons.append("15m متوافق للدخول")
@@ -454,7 +534,6 @@ def score_setup(
         score -= 12
         reasons.append("15m غير مناسب للدخول")
 
-    # Pullback quality around Kijun
     distance_kijun = abs(close_15m - ichi_15m["kijun"]) / ichi_15m["kijun"] if ichi_15m["kijun"] > 0 else 999
     if distance_kijun <= MAX_DISTANCE_FROM_KIJUN_15M:
         score += 12
@@ -463,7 +542,6 @@ def score_setup(
         score -= 10
         reasons.append("السعر بعيد عن Kijun، احتمال الدخول متأخر")
 
-    # Momentum by Tenkan/Kijun and future cloud
     if ichi_1h["future_cloud_bias"] == want and ichi_15m["tk_bias"] == want:
         score += 10
         reasons.append("زخم Ichimoku داعم")
@@ -471,7 +549,6 @@ def score_setup(
         score += 5
         reasons.append("زخم 15m داعم جزئيًا")
 
-    # Candle strength
     if candle["direction"] == want and candle["body_ratio"] >= 0.45:
         score += 8
         reasons.append("شمعة الدخول قوية")
@@ -479,7 +556,6 @@ def score_setup(
         score -= 8
         reasons.append("شمعة الدخول عكس الاتجاه")
 
-    # Structure
     if structure_15m == want:
         score += 6
         reasons.append("هيكل 15m داعم")
@@ -487,7 +563,6 @@ def score_setup(
         score -= 4
         reasons.append("هيكل 15m عرضي")
 
-    # Volume
     if vol_ok:
         score += 5
         reasons.append(f"الحجم جيد ({vol_ratio:.2f}x)")
@@ -495,7 +570,6 @@ def score_setup(
         score -= 3
         reasons.append(f"الحجم ضعيف ({vol_ratio:.2f}x)")
 
-    # Volatility filter
     if MIN_ATR_PERCENT_15M <= atr_pct <= MAX_ATR_PERCENT_15M:
         score += 4
         reasons.append("التذبذب مناسب")
@@ -506,7 +580,6 @@ def score_setup(
         score -= 10
         reasons.append("السوق بارد جدًا")
 
-    # RSI sanity
     if side == "LONG":
         if 42 <= rsi_15m <= 68:
             score += 5
@@ -557,9 +630,8 @@ def decide_best_side(
 
     return None, long_score, short_score
 
-
 # =========================================================
-# 3.2) STATS PERSISTENCE
+# 3.3) STATS PERSISTENCE
 # =========================================================
 def empty_daily_stats() -> dict:
     return {
@@ -568,18 +640,20 @@ def empty_daily_stats() -> dict:
         "wins": 0,
         "losses": 0,
         "realized_pnl": 0.0,
+        "partial_closes": 0,
     }
 
 
 def empty_all_stats() -> dict:
     return {
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": utc_now_iso(),
         "closed_trades": 0,
         "wins": 0,
         "losses": 0,
         "realized_pnl": 0.0,
         "best_win": 0.0,
         "worst_loss": 0.0,
+        "partial_closes": 0,
         "by_symbol": {},
     }
 
@@ -589,6 +663,8 @@ def save_stats_to_disk() -> None:
         payload = {
             "daily_stats": daily_stats,
             "all_stats": all_stats,
+            "data_dir": str(DATA_DIR),
+            "updated_at": utc_now_iso(),
         }
         STATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
@@ -619,14 +695,16 @@ def load_stats_from_disk() -> None:
     daily_stats.setdefault("wins", 0)
     daily_stats.setdefault("losses", 0)
     daily_stats.setdefault("realized_pnl", 0.0)
+    daily_stats.setdefault("partial_closes", 0)
 
-    all_stats.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+    all_stats.setdefault("started_at", utc_now_iso())
     all_stats.setdefault("closed_trades", 0)
     all_stats.setdefault("wins", 0)
     all_stats.setdefault("losses", 0)
     all_stats.setdefault("realized_pnl", 0.0)
     all_stats.setdefault("best_win", 0.0)
     all_stats.setdefault("worst_loss", 0.0)
+    all_stats.setdefault("partial_closes", 0)
     all_stats.setdefault("by_symbol", {})
 
     save_stats_to_disk()
@@ -663,6 +741,66 @@ def update_symbol_stats(symbol: str, pnl_pct: float) -> None:
     all_stats["by_symbol"][symbol] = symbol_stats
 
 
+def estimate_pnl_pct(entry_price: float, exit_price: float, side: str) -> float:
+    if entry_price <= 0:
+        return 0.0
+    if side == "LONG":
+        return ((exit_price - entry_price) / entry_price) * 100
+    return ((entry_price - exit_price) / entry_price) * 100
+
+
+def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side: str, reason: str = "Closed") -> float:
+    reset_daily_stats_if_needed()
+    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
+
+    daily_stats["closed_trades"] += 1
+    daily_stats["realized_pnl"] += pnl_pct
+    if pnl_pct >= 0:
+        daily_stats["wins"] += 1
+    else:
+        daily_stats["losses"] += 1
+
+    all_stats["closed_trades"] += 1
+    all_stats["realized_pnl"] += pnl_pct
+    if pnl_pct >= 0:
+        all_stats["wins"] += 1
+        all_stats["best_win"] = max(safe_float(all_stats.get("best_win", 0.0)), pnl_pct)
+    else:
+        all_stats["losses"] += 1
+        all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
+
+    update_symbol_stats(symbol, pnl_pct)
+    save_stats_to_disk()
+
+    append_journal("FULL_CLOSE", {
+        "symbol": symbol,
+        "side": side,
+        "reason": reason,
+        "entry": entry_price,
+        "exit": exit_price,
+        "pnl_pct": pnl_pct,
+    })
+    return pnl_pct
+
+
+def record_partial_close(symbol: str, side: str, stage: str, entry_price: float, exit_price: float, portion: float) -> float:
+    reset_daily_stats_if_needed()
+    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
+    daily_stats["partial_closes"] += 1
+    all_stats["partial_closes"] += 1
+    save_stats_to_disk()
+    append_journal("PARTIAL_CLOSE", {
+        "symbol": symbol,
+        "side": side,
+        "stage": stage,
+        "entry": entry_price,
+        "exit": exit_price,
+        "portion": portion,
+        "pnl_pct": pnl_pct,
+    })
+    return pnl_pct
+
+
 def build_today_stats_text() -> str:
     reset_daily_stats_if_needed()
     win_rate = 0.0
@@ -672,11 +810,13 @@ def build_today_stats_text() -> str:
     return (
         f"📈 إحصائيات اليوم\n"
         f"التاريخ: {daily_stats['date']}\n"
-        f"الصفقات المغلقة: {daily_stats['closed_trades']}\n"
+        f"الصفقات المغلقة نهائيًا: {daily_stats['closed_trades']}\n"
+        f"الإغلاقات الجزئية TP: {daily_stats.get('partial_closes', 0)}\n"
         f"الرابحة: {daily_stats['wins']}\n"
         f"الخاسرة: {daily_stats['losses']}\n"
         f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL%: {daily_stats['realized_pnl']:.2f}%"
+        f"إجمالي PnL% تقريبي: {daily_stats['realized_pnl']:.2f}%\n"
+        f"ملاحظة: هذا PnL% سعري تقريبي، والرصيد الحقيقي يعتمد على الرسوم والتمويل وحجم الصفقة."
     )
 
 
@@ -695,13 +835,15 @@ def build_all_stats_text() -> str:
     return (
         f"📊 الإحصائيات الكاملة\n"
         f"منذ: {all_stats['started_at'][:10]}\n"
-        f"إجمالي الصفقات المغلقة: {total}\n"
+        f"إجمالي الصفقات المغلقة نهائيًا: {total}\n"
+        f"الإغلاقات الجزئية TP: {all_stats.get('partial_closes', 0)}\n"
         f"الرابحة: {wins}\n"
         f"الخاسرة: {losses}\n"
         f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL%: {pnl:.2f}%\n"
+        f"إجمالي PnL% تقريبي: {pnl:.2f}%\n"
         f"أفضل صفقة: {best_win:.2f}%\n"
-        f"أسوأ صفقة: {worst_loss:.2f}%"
+        f"أسوأ صفقة: {worst_loss:.2f}%\n"
+        f"مسار الحفظ: {DATA_DIR}"
     )
 
 
@@ -724,25 +866,62 @@ def build_best_symbols_text(limit: int = 5) -> str:
         losses = int(data.get("losses", 0))
         win_rate = (wins / total * 100) if total > 0 else 0.0
         lines.append(
-            f"{symbol} | Trades: {total} | WinRate: {win_rate:.1f}% | PnL: {pnl:.2f}%"
+            f"{symbol} | Trades: {total} | WinRate: {win_rate:.1f}% | PnL: {pnl:.2f}% | W/L: {wins}/{losses}"
         )
     return "\n".join(lines)
-
 
 # =========================================================
 # 4) EXCHANGE WRAPPERS
 # =========================================================
-def fetch_balance_usdt() -> float:
+def fetch_balance_details() -> dict:
+    """Return clearer balance view: free, used, total, unrealized PnL, and estimated equity."""
     try:
         bal = exchange.fetch_balance({"type": "swap"})
-        if isinstance(bal.get("USDT"), dict):
-            return safe_float(bal["USDT"].get("free", 0.0))
-        if isinstance(bal.get("free"), dict):
-            return safe_float(bal["free"].get("USDT", 0.0))
-        return 0.0
+        usdt = bal.get("USDT") if isinstance(bal.get("USDT"), dict) else {}
+        free = safe_float(usdt.get("free", 0.0))
+        used = safe_float(usdt.get("used", 0.0))
+        total = safe_float(usdt.get("total", 0.0))
+
+        if free == 0 and isinstance(bal.get("free"), dict):
+            free = safe_float(bal["free"].get("USDT", 0.0))
+        if used == 0 and isinstance(bal.get("used"), dict):
+            used = safe_float(bal["used"].get("USDT", 0.0))
+        if total == 0 and isinstance(bal.get("total"), dict):
+            total = safe_float(bal["total"].get("USDT", 0.0))
+
+        unrealized = 0.0
+        for p in fetch_positions():
+            if safe_float(p.get("contracts", 0)) != 0:
+                unrealized += safe_float(p.get("unrealizedPnl", 0.0))
+
+        equity_est = total + unrealized if total > 0 else free + used + unrealized
+        return {
+            "free": free,
+            "used": used,
+            "total": total,
+            "unrealized_pnl": unrealized,
+            "equity_est": equity_est,
+        }
     except Exception as e:
-        logger.error(f"Balance error: {e}")
-        return 0.0
+        logger.error(f"fetch_balance_details error: {e}")
+        return {"free": 0.0, "used": 0.0, "total": 0.0, "unrealized_pnl": 0.0, "equity_est": 0.0}
+
+
+def build_balance_text() -> str:
+    b = fetch_balance_details()
+    return (
+        f"💰 الرصيد\n"
+        f"Available / المتاح: {b['free']:.2f} USDT\n"
+        f"Used Margin / المحجوز: {b['used']:.2f} USDT\n"
+        f"Wallet Total / الإجمالي: {b['total']:.2f} USDT\n"
+        f"Open PnL / ربح الصفقات المفتوحة: {b['unrealized_pnl']:.4f} USDT\n"
+        f"Estimated Equity / تقدير الحساب: {b['equity_est']:.2f} USDT\n\n"
+        f"مهم: إذا المتاح ينقص، هذا غالبًا بسبب الهامش المحجوز للصفقات المفتوحة، مو شرط خسارة."
+    )
+
+
+def fetch_balance_usdt() -> float:
+    return fetch_balance_details()["free"]
 
 
 def fetch_positions() -> List[dict]:
@@ -799,13 +978,10 @@ def set_leverage_and_margin(symbol: str, leverage: int) -> None:
 
 
 def get_order_params(reduce_only: bool = False) -> dict:
-    params = {
-        "positionSide": "BOTH",
-    }
+    params = {"positionSide": "BOTH"}
     if reduce_only:
         params["reduceOnly"] = True
     return params
-
 
 # =========================================================
 # 5) STRATEGY - ICHIMOKU SMART
@@ -837,18 +1013,10 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
         return None
 
     best_side, best_score, other_score = decide_best_side(
-        bars_4h,
-        bars_1h,
-        bars_15m,
-        ichi_4h,
-        ichi_1h,
-        ichi_15m,
-        atr_15m,
-        rsi_15m,
+        bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
     )
 
     close_15m = bars_15m[-1][4]
-
     base = {
         "symbol": symbol,
         "bars_4h": bars_4h,
@@ -880,42 +1048,15 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     reason_text = build_reason_text(reasons)
 
     if score >= ENTRY_SCORE:
-        return {
-            **base,
-            "signal": best_side,
-            "side": best_side,
-            "score": score,
-            "reason": f"Ichimoku Smart Score {score}/100 | {reason_text}",
-            "reasons": reasons,
-        }
+        return {**base, "signal": best_side, "side": best_side, "score": score, "reason": f"Ichimoku Smart Score {score}/100 | {reason_text}", "reasons": reasons}
 
     if score >= WATCH_SCORE:
-        return {
-            **base,
-            "signal": "WATCH",
-            "side": best_side,
-            "score": score,
-            "reason": f"{best_side} setup قريب لكن ليس قوي كفاية | Score {score}/100 | {reason_text}",
-            "reasons": reasons,
-        }
+        return {**base, "signal": "WATCH", "side": best_side, "score": score, "reason": f"{best_side} setup قريب لكن ليس قوي كفاية | Score {score}/100 | {reason_text}", "reasons": reasons}
 
-    return {
-        **base,
-        "signal": "NO_TRADE",
-        "side": best_side,
-        "score": score,
-        "reason": f"Weak setup | Score {score}/100",
-        "reasons": reasons,
-    }
+    return {**base, "signal": "NO_TRADE", "side": best_side, "score": score, "reason": f"Weak setup | Score {score}/100", "reasons": reasons}
 
 
-def calculate_trade_plan(
-    symbol: str,
-    snapshot: dict,
-    side: str,
-    balance: float,
-    risk_multiplier: float = 1.0,
-) -> Optional[dict]:
+def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float, risk_multiplier: float = 1.0) -> Optional[dict]:
     entry = snapshot["close_15m"]
     atr_15m = snapshot["atr_15m"]
     bars_15m = snapshot["bars_15m"]
@@ -975,30 +1116,16 @@ def get_exit_score(symbol: str, side: str) -> Optional[dict]:
         return None
 
     opposite = "SHORT" if side == "LONG" else "LONG"
-    bars_4h = snapshot["bars_4h"]
-    bars_1h = snapshot["bars_1h"]
-    bars_15m = snapshot["bars_15m"]
-    ichi_4h = snapshot["ichi_4h"]
-    ichi_1h = snapshot["ichi_1h"]
-    ichi_15m = snapshot["ichi_15m"]
-    atr_15m = snapshot["atr_15m"]
-    rsi_15m = snapshot["rsi_15m"]
-
-    current_score = score_setup(
-        side, bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
-    )
-    opposite_score = score_setup(
-        opposite, bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
-    )
+    current_score = score_setup(side, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
+    opposite_score = score_setup(opposite, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
 
     return {
         "current_score": current_score["score"],
         "opposite_score": opposite_score["score"],
         "reason": build_reason_text(current_score["reasons"], limit=3),
         "close": snapshot["close_15m"],
-        "atr_15m": atr_15m,
+        "atr_15m": snapshot["atr_15m"],
     }
-
 
 # =========================================================
 # 6) ORDERS / POSITION MANAGEMENT
@@ -1024,6 +1151,7 @@ def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
             "stop_loss": plan["stop_loss"],
             "tp1": plan["tp1"],
             "tp2": plan["tp2"],
+            "amount": plan["amount"],
             "tp1_taken": False,
             "tp2_taken": False,
             "trailing_active": False,
@@ -1033,10 +1161,26 @@ def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
             "entry_reason": snapshot.get("reason", ""),
             "mode": BOT_MODE,
             "leverage": leverage,
+            "order_id": order.get("id"),
         }
+        save_runtime_state()
+        append_journal("OPEN", {
+            "symbol": symbol,
+            "side": side,
+            "entry": plan["entry"],
+            "stop_loss": plan["stop_loss"],
+            "tp1": plan["tp1"],
+            "tp2": plan["tp2"],
+            "amount": plan["amount"],
+            "risk_pct": plan["effective_risk"] * 100,
+            "score": snapshot.get("score", 0),
+            "mode": BOT_MODE,
+            "leverage": leverage,
+        })
         return True
     except Exception as e:
         logger.error(f"{symbol}: open position error: {e}")
+        append_journal("OPEN_FAILED", {"symbol": symbol, "side": side, "error": str(e)})
         return False
 
 
@@ -1062,47 +1206,12 @@ def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
         return True
     except Exception as e:
         logger.error(f"{symbol}: close position error: {e}")
+        append_journal("CLOSE_FAILED", {"symbol": symbol, "portion": portion, "error": str(e)})
         return False
 
 
-def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side: str) -> None:
-    reset_daily_stats_if_needed()
-
-    pnl_pct = 0.0
-    if entry_price > 0:
-        if side == "LONG":
-            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
-        else:
-            pnl_pct = ((entry_price - exit_price) / entry_price) * 100
-
-    daily_stats["closed_trades"] += 1
-    daily_stats["realized_pnl"] += pnl_pct
-    if pnl_pct >= 0:
-        daily_stats["wins"] += 1
-    else:
-        daily_stats["losses"] += 1
-
-    all_stats["closed_trades"] += 1
-    all_stats["realized_pnl"] += pnl_pct
-    if pnl_pct >= 0:
-        all_stats["wins"] += 1
-        all_stats["best_win"] = max(safe_float(all_stats.get("best_win", 0.0)), pnl_pct)
-    else:
-        all_stats["losses"] += 1
-        all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
-
-    update_symbol_stats(symbol, pnl_pct)
-    save_stats_to_disk()
-
-
 async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: str, reason: str, entry: float, exit_price: float) -> None:
-    pnl_pct = 0.0
-    if entry > 0:
-        if side == "LONG":
-            pnl_pct = ((exit_price - entry) / entry) * 100
-        else:
-            pnl_pct = ((entry - exit_price) / entry) * 100
-
+    pnl_pct = estimate_pnl_pct(entry, exit_price, side)
     await notify(
         context,
         (
@@ -1112,7 +1221,7 @@ async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: st
             f"Reason: {reason}\n"
             f"Entry: {format_num(entry, 6)}\n"
             f"Exit: {format_num(exit_price, 6)}\n"
-            f"PnL%: {format_num(pnl_pct, 2)}%"
+            f"PnL% تقريبي: {format_num(pnl_pct, 2)}%"
         )
     )
 
@@ -1149,6 +1258,7 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 "stop_loss": fallback_sl,
                 "tp1": fallback_tp1,
                 "tp2": fallback_tp2,
+                "amount": contracts,
                 "tp1_taken": False,
                 "tp2_taken": False,
                 "trailing_active": False,
@@ -1156,8 +1266,12 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
                 "opened_at": now_ts(),
                 "entry_score": 0,
                 "entry_reason": "Recovered open position",
+                "mode": BOT_MODE,
+                "leverage": get_current_leverage(),
             }
             state = trade_state[symbol]
+            save_runtime_state()
+            append_journal("RECOVER_POSITION", {"symbol": symbol, "side": side, "entry": entry_price, "contracts": contracts})
 
         bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
         if not bars_15m:
@@ -1171,141 +1285,130 @@ async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
         opposite_score = exit_info["opposite_score"] if exit_info else 0
 
         if side == "LONG":
-            if mark_price <= state["stop_loss"]:
+            if mark_price <= safe_float(state["stop_loss"]):
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if (
-                not state["tp1_taken"]
-                and current_score <= EMERGENCY_EXIT_SCORE
-                and opposite_score >= WATCH_SCORE
-            ):
+            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
                     await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if (not state["tp1_taken"]) and mark_price >= state["tp1"]:
+            if (not state.get("tp1_taken")) and mark_price >= safe_float(state["tp1"]):
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
-                    await notify(
-                        context,
-                        f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
-                    )
+                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
+                    save_runtime_state()
+                    await notify(context, f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
                     continue
 
             refreshed = get_symbol_position(symbol) or pos
-            if (not state["tp2_taken"]) and mark_price >= state["tp2"]:
+            if (not state.get("tp2_taken")) and mark_price >= safe_float(state["tp2"]):
                 if close_position(symbol, refreshed, 0.6):
                     state["tp2_taken"] = True
                     state["trailing_active"] = True
                     state["trailing_stop"] = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
-                    await notify(
-                        context,
-                        f"🚀 TP2 LONG\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
-                    )
+                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
+                    save_runtime_state()
+                    await notify(context, f"🚀 TP2 LONG\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
                     continue
 
-            if state["tp1_taken"] and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
                 refreshed = get_symbol_position(symbol) or pos
                 if close_position(symbol, refreshed, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
                     await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if state["trailing_active"]:
+            if state.get("trailing_active"):
                 new_trailing = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
-                if state["trailing_stop"] is None:
+                if state.get("trailing_stop") is None:
                     state["trailing_stop"] = new_trailing
                 else:
-                    state["trailing_stop"] = max(state["trailing_stop"], new_trailing)
+                    state["trailing_stop"] = max(safe_float(state["trailing_stop"]), new_trailing)
+                save_runtime_state()
 
-                if mark_price <= state["trailing_stop"]:
+                if mark_price <= safe_float(state["trailing_stop"]):
                     refreshed = get_symbol_position(symbol) or pos
                     if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(symbol, entry_price, mark_price, side)
+                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
                         set_cooldown(symbol)
                     continue
 
         else:
-            if mark_price >= state["stop_loss"]:
+            if mark_price >= safe_float(state["stop_loss"]):
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
                     await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if (
-                not state["tp1_taken"]
-                and current_score <= EMERGENCY_EXIT_SCORE
-                and opposite_score >= WATCH_SCORE
-            ):
+            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
                 if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
                     await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if (not state["tp1_taken"]) and mark_price <= state["tp1"]:
+            if (not state.get("tp1_taken")) and mark_price <= safe_float(state["tp1"]):
                 if close_position(symbol, pos, 0.5):
                     state["tp1_taken"] = True
                     state["stop_loss"] = state["entry"]
-                    await notify(
-                        context,
-                        f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100"
-                    )
+                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
+                    save_runtime_state()
+                    await notify(context, f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
                     continue
 
             refreshed = get_symbol_position(symbol) or pos
-            if (not state["tp2_taken"]) and mark_price <= state["tp2"]:
+            if (not state.get("tp2_taken")) and mark_price <= safe_float(state["tp2"]):
                 if close_position(symbol, refreshed, 0.6):
                     state["tp2_taken"] = True
                     state["trailing_active"] = True
                     state["trailing_stop"] = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
-                    await notify(
-                        context,
-                        f"🚀 TP2 SHORT\n{symbol}\nTrailing stop activated\nSmartScore now: {current_score}/100"
-                    )
+                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
+                    save_runtime_state()
+                    await notify(context, f"🚀 TP2 SHORT\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
                     continue
 
-            if state["tp1_taken"] and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
+            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
                 refreshed = get_symbol_position(symbol) or pos
                 if close_position(symbol, refreshed, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side)
+                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
                     await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
                     trade_state.pop(symbol, None)
                     set_cooldown(symbol)
                 continue
 
-            if state["trailing_active"]:
+            if state.get("trailing_active"):
                 new_trailing = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
-                if state["trailing_stop"] is None:
+                if state.get("trailing_stop") is None:
                     state["trailing_stop"] = new_trailing
                 else:
-                    state["trailing_stop"] = min(state["trailing_stop"], new_trailing)
+                    state["trailing_stop"] = min(safe_float(state["trailing_stop"]), new_trailing)
+                save_runtime_state()
 
-                if mark_price >= state["trailing_stop"]:
+                if mark_price >= safe_float(state["trailing_stop"]):
                     refreshed = get_symbol_position(symbol) or pos
                     if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(symbol, entry_price, mark_price, side)
+                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
                         await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
                         trade_state.pop(symbol, None)
                         set_cooldown(symbol)
                     continue
-
 
 # =========================================================
 # 7) SCAN JOB
@@ -1397,7 +1500,6 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
     last_scan_summary = "\n".join(scan_lines[-12:]) if scan_lines else "No scan results."
     logger.info(f"Scan summary:\n{last_scan_summary}")
 
-
 # =========================================================
 # 8) TELEGRAM DASHBOARD
 # =========================================================
@@ -1417,10 +1519,13 @@ def dashboard_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📊 الكل", callback_data="dash_allstats"),
-            InlineKeyboardButton("🏆 الأفضل", callback_data="dash_best"),
+            InlineKeyboardButton("📒 السجل", callback_data="dash_journal"),
         ],
         [
+            InlineKeyboardButton("🏆 الأفضل", callback_data="dash_best"),
             InlineKeyboardButton("🔎 فحص يدوي", callback_data="dash_scan"),
+        ],
+        [
             InlineKeyboardButton("⚙️ المخاطرة", callback_data="dash_risk_menu"),
         ],
         [
@@ -1439,18 +1544,9 @@ def dashboard_kb() -> InlineKeyboardMarkup:
 
 def risk_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("0.3%", callback_data="risk_0.003"),
-            InlineKeyboardButton("0.5%", callback_data="risk_0.005"),
-        ],
-        [
-            InlineKeyboardButton("0.6%", callback_data="risk_0.006"),
-            InlineKeyboardButton("0.75%", callback_data="risk_0.0075"),
-        ],
-        [
-            InlineKeyboardButton("1.0%", callback_data="risk_0.01"),
-            InlineKeyboardButton("⬅️ رجوع", callback_data="dash_home"),
-        ],
+        [InlineKeyboardButton("0.3%", callback_data="risk_0.003"), InlineKeyboardButton("0.5%", callback_data="risk_0.005")],
+        [InlineKeyboardButton("0.6%", callback_data="risk_0.006"), InlineKeyboardButton("0.75%", callback_data="risk_0.0075")],
+        [InlineKeyboardButton("1.0%", callback_data="risk_0.01"), InlineKeyboardButton("⬅️ رجوع", callback_data="dash_home")],
     ])
 
 
@@ -1464,9 +1560,16 @@ async def show_positions(message_target, positions: List[dict]):
         state = trade_state.get(symbol, {})
         extra = ""
         if state:
-            extra = f" | Score: {state.get('entry_score', '-')} | Mode: {state.get('mode', BOT_MODE)} | Lev: {state.get('leverage', get_current_leverage())}x"
+            extra = (
+                f"\nSL: {format_num(safe_float(state.get('stop_loss', 0)), 6)}"
+                f" | TP1: {format_num(safe_float(state.get('tp1', 0)), 6)}"
+                f" | TP2: {format_num(safe_float(state.get('tp2', 0)), 6)}"
+                f" | TP1 taken: {state.get('tp1_taken', False)}"
+                f" | TP2 taken: {state.get('tp2_taken', False)}"
+                f" | Trail: {format_num(safe_float(state.get('trailing_stop', 0)), 6) if state.get('trailing_stop') else '-'}"
+            )
         lines.append(
-            f"{symbol} | {p.get('side')} | "
+            f"{symbol} | {p.get('side')} | Contracts: {contracts}\n"
             f"Entry: {format_num(safe_float(p.get('entryPrice', 0)), 6)} | "
             f"Mark: {format_num(safe_float(p.get('markPrice', 0)), 6)} | "
             f"UPnL: {format_num(safe_float(p.get('unrealizedPnl', 0)), 4)}"
@@ -1475,7 +1578,7 @@ async def show_positions(message_target, positions: List[dict]):
     if not lines:
         await message_target.reply_text("لا توجد صفقات مفتوحة.")
     else:
-        await message_target.reply_text("📂 الصفقات المفتوحة:\n" + "\n".join(lines[:20]))
+        await message_target.reply_text("📂 الصفقات المفتوحة:\n\n" + "\n\n".join(lines[:20]))
 
 
 async def close_by_pnl(update_or_message, mode: str):
@@ -1489,6 +1592,10 @@ async def close_by_pnl(update_or_message, mode: str):
 
         upnl = safe_float(p.get("unrealizedPnl", 0))
         symbol = p["symbol"]
+        entry_price = safe_float(p.get("entryPrice", 0))
+        mark_price = safe_float(p.get("markPrice", 0))
+        side_raw = str(p.get("side", "")).lower()
+        side = "LONG" if side_raw == "long" else "SHORT"
 
         should_close = (
             (mode == "all") or
@@ -1500,6 +1607,7 @@ async def close_by_pnl(update_or_message, mode: str):
             continue
 
         if close_position(symbol, p, 1.0):
+            record_closed_trade(symbol, entry_price, mark_price, side, f"Manual close {mode}")
             trade_state.pop(symbol, None)
             set_cooldown(symbol)
             count += 1
@@ -1513,40 +1621,40 @@ async def close_by_pnl(update_or_message, mode: str):
 
     await update_or_message.reply_text(msg)
 
-
 # =========================================================
 # 9) COMMANDS
 # =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         context.bot_data["chat_id"] = str(update.effective_chat.id)
-    await update.message.reply_text(
-        "🤖 Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:",
-        reply_markup=dashboard_kb()
-    )
+    await update.message.reply_text("🤖 Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:", reply_markup=dashboard_kb())
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paused = "نعم" if bot_paused else "لا"
-    bal = fetch_balance_usdt()
+    b = fetch_balance_details()
     await update.message.reply_text(
         f"📊 الحالة\n"
         f"الوضع: {get_mode_text()}\n"
         f"الاستراتيجية: Ichimoku Smart Score\n"
         f"متوقف: {paused}\n"
-        f"الرصيد: {bal:.2f} USDT\n"
+        f"Available: {b['free']:.2f} USDT\n"
+        f"Used Margin: {b['used']:.2f} USDT\n"
+        f"Wallet Total: {b['total']:.2f} USDT\n"
+        f"Open PnL: {b['unrealized_pnl']:.4f} USDT\n"
+        f"Estimated Equity: {b['equity_est']:.2f} USDT\n"
         f"الصفقات المفتوحة: {count_open_positions()}/{MAX_OPEN_POSITIONS}\n"
         f"المخاطرة الحالية: {risk_per_trade * 100:.2f}%\n"
         f"نقطة الدخول: {ENTRY_SCORE}/100\n"
+        f"DATA_DIR: {DATA_DIR}\n"
         f"آخر إشارة: {last_signal_summary}\n\n"
         f"آخر فحص:\n{last_scan_summary}",
-        reply_markup=dashboard_kb()
+        reply_markup=dashboard_kb(),
     )
 
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bal = fetch_balance_usdt()
-    await update.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
+    await update.message.reply_text(build_balance_text())
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1587,9 +1695,12 @@ async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_best_symbols_text())
 
 
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_journal_text(12))
+
+
 async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await close_by_pnl(update.message, "all")
-
 
 # =========================================================
 # 10) CALLBACKS
@@ -1613,8 +1724,7 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🔥 تم تفعيل الوضع الهجومي AGGRESSIVE (5x)")
 
     elif data == "dash_balance":
-        bal = fetch_balance_usdt()
-        await query.message.reply_text(f"💰 الرصيد المتاح: {bal:.2f} USDT")
+        await query.message.reply_text(build_balance_text())
 
     elif data == "dash_radar":
         await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
@@ -1627,6 +1737,9 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "dash_allstats":
         await query.message.reply_text(build_all_stats_text())
+
+    elif data == "dash_journal":
+        await query.message.reply_text(build_journal_text(12))
 
     elif data == "dash_best":
         await query.message.reply_text(build_best_symbols_text())
@@ -1645,17 +1758,12 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("▶️ تم تشغيل البوت.")
 
     elif data == "dash_risk_menu":
-        await query.message.reply_text(
-            f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%",
-            reply_markup=risk_kb()
-        )
+        await query.message.reply_text(f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%", reply_markup=risk_kb())
 
     elif data.startswith("risk_"):
         try:
             risk_per_trade = float(data.split("_", 1)[1])
-            await query.message.reply_text(
-                f"✅ تم تغيير المخاطرة إلى {risk_per_trade * 100:.2f}%"
-            )
+            await query.message.reply_text(f"✅ تم تغيير المخاطرة إلى {risk_per_trade * 100:.2f}%")
         except Exception:
             await query.message.reply_text("❌ فشل تغيير المخاطرة.")
 
@@ -1668,7 +1776,6 @@ async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "dash_close_losers":
         await close_by_pnl(query.message, "losers")
 
-
 # =========================================================
 # 11) HEALTH
 # =========================================================
@@ -1678,12 +1785,15 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"ICHIMOKU_SMART_BOT_LIVE")
 
+    def log_message(self, format, *args):
+        return
 
 # =========================================================
 # 12) MAIN
 # =========================================================
 def main():
     load_stats_from_disk()
+    load_runtime_state()
 
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
@@ -1714,13 +1824,14 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("allstats", cmd_allstats))
     app.add_handler(CommandHandler("best", cmd_best))
+    app.add_handler(CommandHandler("journal", cmd_journal))
     app.add_handler(CommandHandler("closeall", cmd_close_all))
     app.add_handler(CallbackQueryHandler(dashboard_handler))
 
     app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
     app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
 
-    logger.info("Starting Ichimoku Smart Bot...")
+    logger.info(f"Starting Ichimoku Smart Bot... DATA_DIR={DATA_DIR}")
     app.run_polling(drop_pending_updates=True)
 
 
