@@ -75,7 +75,7 @@ TF_4H = "4h"
 TF_1H = "1h"
 TF_15M = "15m"
 
-MAX_OPEN_POSITIONS = 2
+MAX_OPEN_POSITIONS = 3
 COOLDOWN_MINUTES = 60
 
 # Risk can be changed from Telegram
