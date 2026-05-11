@@ -92,7 +92,7 @@ logger = logging.getLogger("BINANCE_PAPER_BOT")
 exchange = ccxt.binance({
     "enableRateLimit": True,
     "options": {"defaultType": "spot"},
-}) عن
+})
 
 
 # =========================================================
