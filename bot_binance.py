@@ -36,16 +36,16 @@ if TRADING_MODE != "PAPER":
     raise RuntimeError("This version is PAPER only. Set TRADING_MODE=PAPER")
 
 SYMBOLS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
-    "XRP/USDT:USDT",
-    "ADA/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "LINK/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LTC/USDT:USDT",
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "ADA/USDT",
+    "DOGE/USDT",
+    "LINK/USDT",
+    "AVAX/USDT",
+    "LTC/USDT",
 ]
 
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
@@ -89,10 +89,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BINANCE_PAPER_BOT")
 
-exchange = ccxt.binanceusdm({
+exchange = ccxt.binance({
     "enableRateLimit": True,
-    "options": {"defaultType": "future"},
-})
+    "options": {"defaultType": "spot"},
+}) عن
 
 
 # =========================================================
