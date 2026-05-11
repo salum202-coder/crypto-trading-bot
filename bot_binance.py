@@ -21,7 +21,7 @@ ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", "8080"))
 
 TRADING_MODE = os.getenv("TRADING_MODE", "PAPER").upper()
-PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "100"))
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,7 +33,7 @@ if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
 
 if TRADING_MODE != "PAPER":
-    raise RuntimeError("This version is PAPER only. Set TRADING_MODE=PAPER")
+    raise RuntimeError("This bot is PAPER only. Set TRADING_MODE=PAPER")
 
 SYMBOLS = [
     "BTC/USDT",
@@ -50,7 +50,6 @@ SYMBOLS = [
 
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 SCAN_INTERVAL_SECONDS = 60
-POSITION_CHECK_INTERVAL_SECONDS = 20
 
 EMA_PERIOD = 200
 RSI_PERIOD = 14
@@ -87,11 +86,16 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("BINANCE_PAPER_BOT")
+logger = logging.getLogger("OKX_PAPER_TRADING_BOT")
 
+# =========================================================
+# MARKET DATA SOURCE - OKX ONLY
+# =========================================================
 exchange = ccxt.okx({
     "enableRateLimit": True,
-    "options": {"defaultType": "spot"},
+    "options": {
+        "defaultType": "spot",
+    },
 })
 
 
@@ -104,7 +108,10 @@ def now_iso() -> str:
 
 def save_state():
     try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     except Exception as e:
         logger.error(f"save_state error: {e}")
 
@@ -138,25 +145,28 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
+
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.rolling(ATR_PERIOD).mean()
 
     df["sar"] = parabolic_sar(df)
+
     return df
 
 
 def parabolic_sar(df: pd.DataFrame, step: float = SAR_STEP, max_step: float = SAR_MAX) -> pd.Series:
     high = df["high"].values
     low = df["low"].values
-    close = df["close"].values
 
     sar = [0.0] * len(df)
     bull = True
@@ -170,6 +180,7 @@ def parabolic_sar(df: pd.DataFrame, step: float = SAR_STEP, max_step: float = SA
         if bull:
             sar[i] = prev_sar + af * (ep - prev_sar)
             sar[i] = min(sar[i], low[i - 1])
+
             if i > 1:
                 sar[i] = min(sar[i], low[i - 2])
 
@@ -182,9 +193,11 @@ def parabolic_sar(df: pd.DataFrame, step: float = SAR_STEP, max_step: float = SA
                 if high[i] > ep:
                     ep = high[i]
                     af = min(af + step, max_step)
+
         else:
             sar[i] = prev_sar + af * (ep - prev_sar)
             sar[i] = max(sar[i], high[i - 1])
+
             if i > 1:
                 sar[i] = max(sar[i], high[i - 2])
 
@@ -205,13 +218,35 @@ def parabolic_sar(df: pd.DataFrame, step: float = SAR_STEP, max_step: float = SA
 # MARKET
 # =========================================================
 def fetch_df(symbol: str, limit: int = 260) -> Optional[pd.DataFrame]:
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
-        df = pd.DataFrame(bars, columns=["time", "open", "high", "low", "close", "volume"])
-        return calculate_indicators(df)
-    except Exception as e:
-        logger.error(f"{symbol} fetch error: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
+
+            if not bars:
+                logger.error(f"{symbol} fetch error: empty candles")
+                return None
+
+            df = pd.DataFrame(
+                bars,
+                columns=["time", "open", "high", "low", "close", "volume"],
+            )
+
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna()
+
+            if len(df) < EMA_PERIOD + 5:
+                logger.warning(f"{symbol}: not enough candles | got {len(df)}")
+                return None
+
+            return calculate_indicators(df)
+
+        except Exception as e:
+            logger.error(f"{symbol} fetch attempt {attempt + 1}/3 error: {e}")
+            time.sleep(1)
+
+    return None
 
 
 def get_price(symbol: str) -> float:
@@ -224,6 +259,7 @@ def get_price(symbol: str) -> float:
 # =========================================================
 def check_long_signal(symbol: str) -> dict:
     df = fetch_df(symbol)
+
     if df is None or len(df) < EMA_PERIOD + 5:
         return {"signal": False, "reason": "NO_DATA"}
 
@@ -242,24 +278,35 @@ def check_long_signal(symbol: str) -> dict:
         return {"signal": False, "reason": "INDICATORS_NOT_READY"}
 
     if close <= ema200:
-        return {"signal": False, "reason": "Price below EMA200"}
+        return {"signal": False, "reason": f"Price below EMA200 | Close {close:.4f}"}
 
     rsi_recovery = rsi_prev < 30 and rsi_now > 30
-    recent_under_30 = df["rsi"].iloc[-5:].min() < 30 and rsi_now > df["rsi"].iloc[-2]
+    recent_under_30 = df["rsi"].iloc[-5:].min() < 30 and rsi_now > float(prev["rsi"])
 
     if not (rsi_recovery or recent_under_30):
-        return {"signal": False, "reason": f"RSI no pullback recovery | RSI {rsi_now:.2f}"}
+        return {
+            "signal": False,
+            "reason": f"RSI no pullback recovery | RSI {rsi_now:.2f}",
+        }
 
     sar_flip = sar_prev > float(prev["close"]) and sar_now < close
+
     if not sar_flip:
         return {"signal": False, "reason": "SAR flip not confirmed"}
 
     distance_from_ema = abs(close - ema200) / ema200
+
     if distance_from_ema > MAX_DISTANCE_FROM_EMA:
-        return {"signal": False, "reason": f"Anti-FOMO: far from EMA {distance_from_ema*100:.2f}%"}
+        return {
+            "signal": False,
+            "reason": f"Anti-FOMO: far from EMA {distance_from_ema * 100:.2f}%",
+        }
 
     if rsi_now > MAX_RSI_CONFIRM:
-        return {"signal": False, "reason": f"Anti-FOMO: RSI too high {rsi_now:.2f}"}
+        return {
+            "signal": False,
+            "reason": f"Anti-FOMO: RSI too high {rsi_now:.2f}",
+        }
 
     stop_loss = close - (atr * ATR_SL_MULTIPLIER)
 
@@ -290,8 +337,10 @@ def current_leverage() -> int:
 def calc_amount(entry: float, stop_loss: float) -> float:
     risk_usdt = float(state["balance"]) * current_risk_pct()
     risk_per_unit = entry - stop_loss
+
     if risk_per_unit <= 0:
         return 0.0
+
     return risk_usdt / risk_per_unit
 
 
@@ -332,6 +381,7 @@ def open_paper_position(symbol: str, signal: dict) -> bool:
 
 def close_paper_position(symbol: str, exit_price: float, reason: str) -> Optional[dict]:
     pos = state["positions"].get(symbol)
+
     if not pos:
         return None
 
@@ -364,6 +414,7 @@ def close_paper_position(symbol: str, exit_price: float, reason: str) -> Optiona
         "reason": reason,
         "balance": state["balance"],
     }
+
     journal("CLOSE", payload)
     return payload
 
@@ -373,6 +424,7 @@ def update_open_positions() -> List[dict]:
 
     for symbol, pos in list(state["positions"].items()):
         df = fetch_df(symbol)
+
         if df is None or len(df) < 5:
             continue
 
@@ -384,24 +436,34 @@ def update_open_positions() -> List[dict]:
 
         if sar > current_sl and sar < close:
             pos["trailing_stop"] = sar
+
             updates.append({
                 "type": "SL_UPDATE",
                 "symbol": symbol,
                 "new_sl": sar,
                 "price": close,
             })
-            journal("SL_UPDATE", {"symbol": symbol, "new_sl": sar, "price": close})
+
+            journal("SL_UPDATE", {
+                "symbol": symbol,
+                "new_sl": sar,
+                "price": close,
+            })
 
         if close <= float(pos["trailing_stop"]):
             closed = close_paper_position(symbol, close, "Trailing Stop / Stop Loss")
+
             if closed:
                 updates.append({"type": "CLOSE", **closed})
+
             continue
 
         if sar > close:
             closed = close_paper_position(symbol, close, "SAR Exit Signal")
+
             if closed:
                 updates.append({"type": "CLOSE", **closed})
+
             continue
 
     save_state()
@@ -428,11 +490,13 @@ def keyboard():
 def allowed(update: Update) -> bool:
     if not ENV_CHAT_ID:
         return True
+
     return str(update.effective_chat.id) == str(ENV_CHAT_ID)
 
 
 async def send_to_user(context: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = ENV_CHAT_ID or context.bot_data.get("chat_id")
+
     if chat_id:
         await context.bot.send_message(chat_id=chat_id, text=text)
 
@@ -440,10 +504,13 @@ async def send_to_user(context: ContextTypes.DEFAULT_TYPE, text: str):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
+
     context.bot_data["chat_id"] = str(update.effective_chat.id)
+
     await update.message.reply_text(
         "🤖 Binance Paper Trading Bot جاهز\n"
         "الوضع: تجريبي فقط\n"
+        "مصدر البيانات: OKX\n"
         f"الرصيد الوهمي: {state['balance']:.2f} USDT",
         reply_markup=keyboard(),
     )
@@ -469,7 +536,8 @@ def balance_text() -> str:
         f"Equity: {equity:.2f} USDT\n"
         f"Start Balance: {PAPER_START_BALANCE:.2f} USDT\n"
         f"Mode: {risk_mode} ({current_leverage()}x)\n"
-        f"Risk: {current_risk_pct()*100:.2f}%"
+        f"Risk: {current_risk_pct() * 100:.2f}%\n"
+        f"Market Data: OKX"
     )
 
 
@@ -478,6 +546,7 @@ def positions_text() -> str:
         return "📁 لا توجد صفقات مفتوحة."
 
     lines = ["📁 الصفقات المفتوحة:"]
+
     for symbol, pos in state["positions"].items():
         try:
             price = get_price(symbol)
@@ -513,8 +582,10 @@ async def scan_now(context: ContextTypes.DEFAULT_TYPE) -> str:
             continue
 
         signal = check_long_signal(symbol)
+
         if signal["signal"]:
             opened = open_paper_position(symbol, signal)
+
             if opened:
                 msg = (
                     f"🚀 صفقة وهمية جديدة\n"
@@ -523,12 +594,16 @@ async def scan_now(context: ContextTypes.DEFAULT_TYPE) -> str:
                     f"Entry: {signal['entry']:.6f}\n"
                     f"SL: {signal['stop_loss']:.6f}\n"
                     f"RSI: {signal['rsi']:.2f}\n"
+                    f"Market Data: OKX\n"
                     f"Reason: {signal['reason']}"
                 )
+
                 await send_to_user(context, msg)
                 lines.append(f"{symbol}: OPENED LONG")
+
             else:
                 lines.append(f"{symbol}: SIGNAL BUT NOT OPENED")
+
         else:
             lines.append(f"{symbol}: NO_TRADE | {signal['reason']}")
 
@@ -560,9 +635,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start = time.time()
             exchange.fetch_time()
             latency = (time.time() - start) * 1000
-            await update.message.reply_text(f"🟢 النظام شغال\nBinance latency: {latency:.0f} ms\nMode: PAPER")
+
+            await update.message.reply_text(
+                f"🟢 النظام شغال\n"
+                f"Market Data: OKX\n"
+                f"Latency: {latency:.0f} ms\n"
+                f"Mode: PAPER"
+            )
+
         except Exception as e:
-            await update.message.reply_text(f"🔴 مشكلة اتصال Binance:\n{e}")
+            await update.message.reply_text(f"🔴 مشكلة اتصال OKX:\n{e}")
 
     elif text == "تشغيل ▶️":
         bot_paused = False
@@ -582,10 +664,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "إغلاق الكل 🛑":
         count = 0
+
         for symbol in list(state["positions"].keys()):
             price = get_price(symbol)
             close_paper_position(symbol, price, "Manual Close All")
             count += 1
+
         await update.message.reply_text(f"🛑 تم إغلاق {count} صفقة وهمية.")
 
     elif text in ("إغلاق الرابحة ✅", "إغلاق الخاسرة ❌"):
@@ -595,6 +679,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for symbol, pos in list(state["positions"].items()):
             price = get_price(symbol)
             pnl = (price - float(pos["entry"])) * float(pos["amount"])
+
             if (winners and pnl > 0) or ((not winners) and pnl < 0):
                 close_paper_position(symbol, price, "Manual Close Winners/Losers")
                 count += 1
@@ -603,12 +688,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "طوارئ 🚨":
         count = 0
+
         for symbol in list(state["positions"].keys()):
             price = get_price(symbol)
             close_paper_position(symbol, price, "Emergency Close")
             count += 1
+
         bot_paused = True
-        await update.message.reply_text(f"🚨 تم إغلاق كل الصفقات وإيقاف البوت. العدد: {count}")
+
+        await update.message.reply_text(
+            f"🚨 تم إغلاق كل الصفقات وإيقاف البوت. العدد: {count}"
+        )
 
     else:
         await update.message.reply_text("استخدم الأزرار بالأسفل.", reply_markup=keyboard())
@@ -619,12 +709,17 @@ async def trading_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     updates = update_open_positions()
+
     for u in updates:
         if u["type"] == "SL_UPDATE":
             await send_to_user(
                 context,
-                f"🔁 تحديث وقف الخسارة\n{u['symbol']}\nNew SL: {u['new_sl']:.6f}\nPrice: {u['price']:.6f}"
+                f"🔁 تحديث وقف الخسارة\n"
+                f"{u['symbol']}\n"
+                f"New SL: {u['new_sl']:.6f}\n"
+                f"Price: {u['price']:.6f}"
             )
+
         elif u["type"] == "CLOSE":
             await send_to_user(
                 context,
@@ -647,7 +742,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"BINANCE_PAPER_BOT_LIVE")
+        self.wfile.write(b"OKX_MARKET_DATA_PAPER_BOT_LIVE")
 
     def log_message(self, format, *args):
         return
@@ -675,7 +770,10 @@ def main():
 
     app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
 
-    logger.info(f"Starting Binance Paper Bot | DATA_DIR={DATA_DIR} | Balance={state['balance']}")
+    logger.info(
+        f"Starting Paper Trading Bot | Market Data=OKX | DATA_DIR={DATA_DIR} | Balance={state['balance']}"
+    )
+
     app.run_polling(drop_pending_updates=True)
 
 
