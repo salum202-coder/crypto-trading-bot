@@ -1,3 +1,4 @@
-git add .
-git commit -m "Switch market data to OKX"
-git push
+python-telegram-bot[job-queue]==20.7
+ccxt
+pandas
+requests
