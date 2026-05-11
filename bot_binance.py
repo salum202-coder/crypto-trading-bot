@@ -89,7 +89,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BINANCE_PAPER_BOT")
 
-exchange = ccxt.binance({
+exchange = ccxt.okx({
     "enableRateLimit": True,
     "options": {"defaultType": "spot"},
 })
