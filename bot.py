@@ -1035,48 +1035,46 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
     # Require all three timeframes to agree.
     # This reduces false entries during reversals and choppy markets.
     # =========================================================
-
     trend_4h = ichimoku_trend(ichi_4h)
     trend_1h = ichimoku_trend(ichi_1h)
     trend_15m = ichimoku_trend(ichi_15m)
 
-    # LONG only if all three are bullish
     if best_side == "LONG":
-    if not (
-        trend_4h == "BULL"
-        and trend_1h == "BULL"
-        and trend_15m == "BULL"
-    ):
-        return {
-            **base,
-            "signal": "NO_TRADE",
-            "score": 0,
-            "side": None,
-            "reason": (
-                f"Regime filter blocked LONG | "
-                f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
-            ),
-            "reasons": [],
-        }
+        if not (
+            trend_4h == "BULL"
+            and trend_1h == "BULL"
+            and trend_15m == "BULL"
+        ):
+            return {
+                **base,
+                "signal": "NO_TRADE",
+                "score": 0,
+                "side": None,
+                "reason": (
+                    f"Regime filter blocked LONG | "
+                    f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
+                ),
+                "reasons": [],
+            }
 
-# SHORT only if all three are bearish
-if best_side == "SHORT":
-    if not (
-        trend_4h == "BEAR"
-        and trend_1h == "BEAR"
-        and trend_15m == "BEAR"
-    ):
-        return {
-            **base,
-            "signal": "NO_TRADE",
-            "score": 0,
-            "side": None,
-            "reason": (
-                f"Regime filter blocked SHORT | "
-                f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
-            ),
-            "reasons": [],
-        }
+    elif best_side == "SHORT":
+        if not (
+            trend_4h == "BEAR"
+            and trend_1h == "BEAR"
+            and trend_15m == "BEAR"
+        ):
+            return {
+                **base,
+                "signal": "NO_TRADE",
+                "score": 0,
+                "side": None,
+                "reason": (
+                    f"Regime filter blocked SHORT | "
+                    f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
+                ),
+                "reasons": [],
+            }
+
     if not best_side:
         long_s = best_score["score"]
         short_s = other_score["score"]
