@@ -1030,18 +1030,18 @@ def get_market_snapshot(symbol: str) -> Optional[dict]:
         "ichi_1h": ichi_1h,
         "ichi_15m": ichi_15m,
     }
-# =========================================================
-# STRONG TREND REGIME FILTER
-# Require all three timeframes to agree.
-# This reduces false entries during reversals and choppy markets.
-# =========================================================
+    # =========================================================
+    # STRONG TREND REGIME FILTER
+    # Require all three timeframes to agree.
+    # This reduces false entries during reversals and choppy markets.
+    # =========================================================
 
-trend_4h = ichimoku_trend(ichi_4h)
-trend_1h = ichimoku_trend(ichi_1h)
-trend_15m = ichimoku_trend(ichi_15m)
+    trend_4h = ichimoku_trend(ichi_4h)
+    trend_1h = ichimoku_trend(ichi_1h)
+    trend_15m = ichimoku_trend(ichi_15m)
 
-# LONG only if all three are bullish
-if best_side == "LONG":
+    # LONG only if all three are bullish
+    if best_side == "LONG":
     if not (
         trend_4h == "BULL"
         and trend_1h == "BULL"
