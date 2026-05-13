@@ -1,1882 +1,1431 @@
+"""
+BingX Futures Live Trading Bot
+Strategy: EMA 200 + RSI Recovery/Rejection + ATR Stop Loss + Parabolic SAR
+Exchange: BingX USDT-M Futures via ccxt
+Telegram: python-telegram-bot with JobQueue
+Hosting: Render compatible health server
+
+IMPORTANT:
+- This bot places REAL market orders when API keys are valid.
+- Stop loss is managed by the bot loop, not as an exchange-native stop order.
+  If the bot/server/API goes offline, the protection loop will not run.
+- Test with very small balance and very small risk first.
+"""
+
+from __future__ import annotations
+
 import os
 import json
-import asyncio
 import time
+import math
+import asyncio
 import logging
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import pandas as pd
+
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 # =========================================================
-# 1) CONFIG
+# 1) ENVIRONMENT + BASIC CONFIG
 # =========================================================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BINGX_API_KEY = os.getenv("BINGX_API_KEY")
-BINGX_SECRET = os.getenv("BINGX_SECRET")
-PORT = int(os.environ.get("PORT", "8080"))
 
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN")
-if not BINGX_API_KEY or not BINGX_SECRET:
-    raise RuntimeError("Missing BINGX_API_KEY or BINGX_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+ENV_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_SECRET = os.getenv("BINGX_SECRET", "").strip()
 
-# IMPORTANT FOR RENDER:
-# Add Persistent Disk and set DATA_DIR=/data
-# If DATA_DIR is not set, files will be saved in the current project folder and may reset after deploy.
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+PORT = int(os.getenv("PORT", "8080"))
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_TOKEN environment variable")
+if not ENV_CHAT_ID:
+    raise RuntimeError("Missing TELEGRAM_CHAT_ID environment variable")
+if not BINGX_API_KEY:
+    raise RuntimeError("Missing BINGX_API_KEY environment variable")
+if not BINGX_SECRET:
+    raise RuntimeError("Missing BINGX_SECRET environment variable")
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+STATE_FILE = DATA_DIR / "state.json"
 STATS_FILE = DATA_DIR / "stats.json"
-JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
-STATE_FILE = DATA_DIR / "trade_state.json"
-COOLDOWNS_FILE = DATA_DIR / "cooldowns.json"
+OPEN_META_FILE = DATA_DIR / "open_trades.json"
 
-# BingX Perpetual USDT-M
-MARGIN_MODE = "isolated"
-
-# Mode system
-BOT_MODE = os.getenv("BOT_MODE", "NORMAL").upper()
-if BOT_MODE not in ("NORMAL", "AGGRESSIVE"):
-    BOT_MODE = "NORMAL"
-
-NORMAL_LEVERAGE = 3
-AGGRESSIVE_LEVERAGE = 5
-DEFAULT_LEVERAGE = NORMAL_LEVERAGE
-
+# You can override symbols from Render ENV:
+# SYMBOLS=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT
 SYMBOLS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
-    "XRP/USDT:USDT",
-    "ADA/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "LINK/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LTC/USDT:USDT",
-    "TRX/USDT:USDT",
-    "ATOM/USDT:USDT",
-    "NEAR/USDT:USDT",
+    s.strip()
+    for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
+    if s.strip()
 ]
 
-TF_4H = "4h"
-TF_1H = "1h"
-TF_15M = "15m"
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+OHLCV_LIMIT = int(os.getenv("OHLCV_LIMIT", "260"))
 
-MAX_OPEN_POSITIONS = 3
-COOLDOWN_MINUTES = 60
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
-# Risk can be changed from Telegram
-risk_per_trade = 0.005  # 0.5%
+EMA_PERIOD = int(os.getenv("EMA_PERIOD", "200"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 
-ATR_PERIOD = 14
-RSI_PERIOD = 14
-EMA_FAST_PERIOD = 20
-VOLUME_SMA_PERIOD = 20
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.8"))
+ATR_TRAIL_MULT = float(os.getenv("ATR_TRAIL_MULT", "1.25"))
 
-# Ichimoku settings
-ICHIMOKU_TENKAN = 9
-ICHIMOKU_KIJUN = 26
-ICHIMOKU_SENKOU_B = 52
-ICHIMOKU_DISPLACEMENT = 26
+NORMAL_LEVERAGE = int(os.getenv("NORMAL_LEVERAGE", "3"))
+AGGRESSIVE_LEVERAGE = int(os.getenv("AGGRESSIVE_LEVERAGE", "5"))
 
-# Smart score thresholds
-ENTRY_SCORE = 82
-WATCH_SCORE = 70
-MIN_RR = 1.35
+NORMAL_RISK_PCT = float(os.getenv("NORMAL_RISK_PCT", "1.0"))       # 1.0 = 1%
+AGGRESSIVE_RISK_PCT = float(os.getenv("AGGRESSIVE_RISK_PCT", "1.5")) # 1.5 = 1.5%
 
-# Entry filters
-MAX_DISTANCE_FROM_KIJUN_15M = 0.018
-MAX_ATR_PERCENT_15M = 0.025
-MIN_ATR_PERCENT_15M = 0.0015
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "45"))
 
-# Exit logic
-TP1_R = 0.9
-TP2_R = 1.8
-TRAILING_ATR_MULTIPLIER = 1.15
-EARLY_EXIT_SCORE = 45
-EMERGENCY_EXIT_SCORE = 35
+# Safety cap: max notional per trade as a percentage of equity * leverage.
+# Example: equity 1000, leverage 3, cap 0.30 => max notional 900 USDT.
+POSITION_EQUITY_CAP = float(os.getenv("POSITION_EQUITY_CAP", "0.30"))
 
-SCAN_INTERVAL_SECONDS = 60
-POSITION_CHECK_INTERVAL_SECONDS = 20
+MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "6"))
+
+# Reduce noisy repeated alerts.
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "120"))
+
+# =========================================================
+# 2) LOGGING
+# =========================================================
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("ICHIMOKU_SMART_BOT")
-
-exchange = ccxt.bingx({
-    "apiKey": BINGX_API_KEY,
-    "secret": BINGX_SECRET,
-    "enableRateLimit": True,
-    "options": {
-        "defaultType": "swap",
-    },
-})
+logger = logging.getLogger("BINGX_LIVE_EMA_RSI_SAR_BOT")
 
 # =========================================================
-# 2) STATE
+# 3) JSON STORAGE
 # =========================================================
-cooldowns: Dict[str, int] = {}
-trade_state: Dict[str, Dict[str, Any]] = {}
-last_scan_summary = "No scans yet."
-last_signal_summary = "No signals yet."
-bot_paused = False
 
-daily_stats = {}
-all_stats = {}
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            atomic_write_json(path, default)
+            return dict(default)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.exception("Failed to read JSON %s: %s", path, exc)
+        return dict(default)
+
+
+DEFAULT_STATE: Dict[str, Any] = {
+    "running": True,
+    "emergency": False,
+    "mode": "NORMAL",
+    "leverage": NORMAL_LEVERAGE,
+    "risk_pct": NORMAL_RISK_PCT,
+    "last_scan": {},
+    "last_trade_ts": {},
+    "last_alert_ts": {},
+    "started_at": utc_now(),
+    "updated_at": utc_now(),
+}
+
+DEFAULT_STATS: Dict[str, Any] = {
+    "since": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    "total_closed": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0.0,
+    "total_pnl_pct": 0.0,
+    "best_trade_pct": 0.0,
+    "worst_trade_pct": 0.0,
+    "history": [],
+    "updated_at": utc_now(),
+}
+
+DEFAULT_OPEN_META: Dict[str, Any] = {}
+
+STATE = read_json(STATE_FILE, DEFAULT_STATE)
+STATS = read_json(STATS_FILE, DEFAULT_STATS)
+OPEN_META = read_json(OPEN_META_FILE, DEFAULT_OPEN_META)
+
+
+def save_state() -> None:
+    STATE["updated_at"] = utc_now()
+    atomic_write_json(STATE_FILE, STATE)
+
+
+def save_stats() -> None:
+    total = int(STATS.get("total_closed", 0))
+    wins = int(STATS.get("wins", 0))
+    STATS["win_rate"] = round((wins / total * 100.0), 2) if total else 0.0
+    STATS["total_pnl_pct"] = round(float(STATS.get("total_pnl_pct", 0.0)), 4)
+    STATS["best_trade_pct"] = round(float(STATS.get("best_trade_pct", 0.0)), 4)
+    STATS["worst_trade_pct"] = round(float(STATS.get("worst_trade_pct", 0.0)), 4)
+    STATS["updated_at"] = utc_now()
+
+    # Keep file small.
+    history = STATS.get("history", [])
+    if isinstance(history, list) and len(history) > 300:
+        STATS["history"] = history[-300:]
+
+    atomic_write_json(STATS_FILE, STATS)
+
+
+def save_open_meta() -> None:
+    atomic_write_json(OPEN_META_FILE, OPEN_META)
+
 
 # =========================================================
-# 3) BASIC HELPERS
+# 4) HEALTH SERVER FOR RENDER
 # =========================================================
-def now_ts() -> int:
-    return int(time.time())
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        payload = {
+            "status": "ok",
+            "service": "bingx-live-trading-bot",
+            "running": STATE.get("running"),
+            "emergency": STATE.get("emergency"),
+            "time": utc_now(),
+        }
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def start_health_server() -> None:
+    def _run() -> None:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info("Health server started on port %s", PORT)
+        server.serve_forever()
+
+    thread = threading.Thread(target=_run, name="health-server", daemon=True)
+    thread.start()
 
 
-def utc_today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+# =========================================================
+# 5) EXCHANGE SETUP
+# =========================================================
+
+EXCHANGE_LOCK = threading.RLock()
+JOB_LOCK = asyncio.Lock()
+
+exchange = ccxt.bingx(
+    {
+        "apiKey": BINGX_API_KEY,
+        "secret": BINGX_SECRET,
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {
+            "defaultType": "swap",
+            "defaultSubType": "linear",
+            "adjustForTimeDifference": True,
+        },
+    }
+)
 
 
-def safe_float(value, default: float = 0.0) -> float:
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-        return float(value)
+        if isinstance(value, str) and value.strip() == "":
+            return default
+        x = float(value)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
     except Exception:
         return default
 
 
-def format_num(v: float, digits: int = 6) -> str:
+def normalize_symbol(symbol: str) -> str:
+    """Return an available ccxt symbol where possible."""
     try:
-        return f"{float(v):.{digits}f}"
+        if symbol in exchange.markets:
+            return symbol
+        base = symbol.split("/")[0].upper()
+        for candidate in (f"{base}/USDT:USDT", f"{base}/USDT"):
+            if candidate in exchange.markets:
+                return candidate
     except Exception:
-        return str(v)
+        pass
+    return symbol
 
 
-def get_current_leverage() -> int:
-    return AGGRESSIVE_LEVERAGE if BOT_MODE == "AGGRESSIVE" else NORMAL_LEVERAGE
+def init_exchange() -> None:
+    with EXCHANGE_LOCK:
+        markets = exchange.load_markets()
+        logger.info("Loaded %s BingX markets", len(markets))
+
+        # Normalize configured symbols after market load.
+        for idx, s in enumerate(list(SYMBOLS)):
+            SYMBOLS[idx] = normalize_symbol(s)
+
+        # Try one-way mode. Some accounts/exchanges reject this call if already set.
+        try:
+            if hasattr(exchange, "set_position_mode"):
+                exchange.set_position_mode(False)
+                logger.info("Position mode set to One-Way")
+        except Exception as exc:
+            logger.warning("Could not set global One-Way mode, will continue: %s", exc)
+
+        # Preload per-symbol isolated + leverage.
+        for s in SYMBOLS:
+            configure_symbol(s, int(STATE.get("leverage", NORMAL_LEVERAGE)))
 
 
-def get_mode_text() -> str:
-    return f"{BOT_MODE} ({get_current_leverage()}x)"
+def configure_symbol(symbol: str, leverage: int) -> None:
+    """Set isolated margin and leverage. Errors are logged but not fatal."""
+    with EXCHANGE_LOCK:
+        try:
+            if hasattr(exchange, "set_margin_mode"):
+                exchange.set_margin_mode("isolated", symbol)
+                logger.info("Margin mode set to isolated: %s", symbol)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "no need" not in msg and "not modified" not in msg and "same" not in msg:
+                logger.warning("Could not set isolated margin for %s: %s", symbol, exc)
 
+        try:
+            if hasattr(exchange, "set_leverage"):
+                exchange.set_leverage(leverage, symbol, params={"marginMode": "isolated"})
+                logger.info("Leverage set to %sx: %s", leverage, symbol)
+        except Exception as exc:
+            logger.warning("Could not set leverage for %s: %s", symbol, exc)
 
-def get_active_chat_id(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[str]:
-    if context and context.bot_data.get("chat_id"):
-        return str(context.bot_data["chat_id"])
-    if ENV_CHAT_ID:
-        return str(ENV_CHAT_ID)
-    return None
-
-
-async def notify(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    chat_id = get_active_chat_id(context)
-    if not chat_id:
-        logger.info("No active chat id yet; skipping notification")
-        return
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        logger.error(f"Telegram notify error: {e}")
-
-
-def is_in_cooldown(symbol: str) -> bool:
-    return now_ts() < int(cooldowns.get(symbol, 0))
-
-
-def set_cooldown(symbol: str) -> None:
-    cooldowns[symbol] = now_ts() + COOLDOWN_MINUTES * 60
-    save_runtime_state()
-
-
-def sma(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-
-def ema(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    val = sum(values[:period]) / period
-    for x in values[period:]:
-        val = x * k + val * (1 - k)
-    return val
-
-
-def rsi(values: List[float], period: int = RSI_PERIOD) -> Optional[float]:
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    for i in range(period + 1, len(values)):
-        diff = values[i] - values[i - 1]
-        gain = max(diff, 0.0)
-        loss = max(-diff, 0.0)
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def atr_from_ohlcv(ohlcv: List[List[float]], period: int) -> Optional[float]:
-    if len(ohlcv) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(ohlcv)):
-        prev_close = ohlcv[i - 1][4]
-        curr_high = ohlcv[i][2]
-        curr_low = ohlcv[i][3]
-        tr = max(
-            curr_high - curr_low,
-            abs(curr_high - prev_close),
-            abs(curr_low - prev_close),
-        )
-        trs.append(tr)
-    if len(trs) < period:
-        return None
-    return sum(trs[-period:]) / period
-
-
-def normalize_amount(symbol: str, amount: float) -> float:
-    try:
-        return float(exchange.amount_to_precision(symbol, amount))
-    except Exception:
-        return amount
-
-
-def normalize_price(symbol: str, price: float) -> float:
-    try:
-        return float(exchange.price_to_precision(symbol, price))
-    except Exception:
-        return price
 
 # =========================================================
-# 3.1) PERSISTENT RUNTIME STATE + JOURNAL
+# 6) INDICATORS: EMA, RSI, ATR, PARABOLIC SAR
 # =========================================================
-def append_journal(event_type: str, payload: dict) -> None:
-    """Append every important trade event to JSONL so deploys do not erase history."""
-    try:
-        row = {
-            "ts": utc_now_iso(),
-            "event": event_type,
-            **payload,
-        }
-        with JOURNAL_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.error(f"append_journal error: {e}")
+
+def calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.astype(float).fillna(50.0)
 
 
-def save_runtime_state() -> None:
-    try:
-        STATE_FILE.write_text(json.dumps(trade_state, ensure_ascii=False, indent=2), encoding="utf-8")
-        COOLDOWNS_FILE.write_text(json.dumps(cooldowns, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.error(f"save_runtime_state error: {e}")
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean().astype(float)
 
 
-def load_runtime_state() -> None:
-    global trade_state, cooldowns
-    try:
-        if STATE_FILE.exists():
-            trade_state = json.loads(STATE_FILE.read_text(encoding="utf-8")) or {}
-    except Exception as e:
-        logger.error(f"load trade_state error: {e}")
-        trade_state = {}
+def calc_psar(high: pd.Series, low: pd.Series, step: float = 0.02, max_step: float = 0.2) -> pd.Series:
+    """
+    Simple Parabolic SAR implementation.
+    Returns SAR value for each candle.
+    """
+    h = high.astype(float).tolist()
+    l = low.astype(float).tolist()
+    n = len(h)
+    if n < 3:
+        return pd.Series([float("nan")] * n, index=high.index)
 
-    try:
-        if COOLDOWNS_FILE.exists():
-            cooldowns = json.loads(COOLDOWNS_FILE.read_text(encoding="utf-8")) or {}
-            cooldowns = {str(k): int(v) for k, v in cooldowns.items()}
-    except Exception as e:
-        logger.error(f"load cooldowns error: {e}")
-        cooldowns = {}
+    psar = [float("nan")] * n
+    bull = True
+    af = step
+    ep = h[0]
+    sar = l[0]
+
+    # Choose initial trend from first two candles.
+    if h[1] + l[1] < h[0] + l[0]:
+        bull = False
+        ep = l[0]
+        sar = h[0]
+
+    for i in range(1, n):
+        prev_sar = sar
+
+        if bull:
+            sar = prev_sar + af * (ep - prev_sar)
+            if i >= 2:
+                sar = min(sar, l[i - 1], l[i - 2])
+            else:
+                sar = min(sar, l[i - 1])
+
+            if l[i] < sar:
+                bull = False
+                sar = ep
+                ep = l[i]
+                af = step
+            else:
+                if h[i] > ep:
+                    ep = h[i]
+                    af = min(af + step, max_step)
+        else:
+            sar = prev_sar + af * (ep - prev_sar)
+            if i >= 2:
+                sar = max(sar, h[i - 1], h[i - 2])
+            else:
+                sar = max(sar, h[i - 1])
+
+            if h[i] > sar:
+                bull = True
+                sar = ep
+                ep = h[i]
+                af = step
+            else:
+                if l[i] < ep:
+                    ep = l[i]
+                    af = min(af + step, max_step)
+
+        psar[i] = sar
+
+    return pd.Series(psar, index=high.index).astype(float)
 
 
-def get_recent_journal_lines(limit: int = 10) -> List[dict]:
-    try:
-        if not JOURNAL_FILE.exists():
-            return []
-        lines = JOURNAL_FILE.read_text(encoding="utf-8").splitlines()
-        rows = []
-        for line in lines[-limit:]:
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
-        return rows
-    except Exception as e:
-        logger.error(f"get_recent_journal_lines error: {e}")
-        return []
+def fetch_ohlcv_df(symbol: str, timeframe: str = TIMEFRAME, limit: int = OHLCV_LIMIT) -> Optional[pd.DataFrame]:
+    with EXCHANGE_LOCK:
+        try:
+            rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except Exception as exc:
+            logger.warning("fetch_ohlcv failed for %s: %s", symbol, exc)
+            return None
 
-
-def build_journal_text(limit: int = 10) -> str:
-    rows = get_recent_journal_lines(limit)
-    if not rows:
-        return "📒 لا يوجد سجل صفقات محفوظ حتى الآن."
-
-    lines = [f"📒 آخر {len(rows)} أحداث في سجل الصفقات:"]
-    for r in rows:
-        ts = str(r.get("ts", ""))[:19]
-        event = r.get("event", "-")
-        symbol = r.get("symbol", "-")
-        side = r.get("side", "-")
-        reason = r.get("reason", r.get("stage", ""))
-        pnl = r.get("pnl_pct")
-        pnl_text = f" | PnL {safe_float(pnl):.2f}%" if pnl is not None else ""
-        lines.append(f"{ts} | {event} | {symbol} | {side} | {reason}{pnl_text}")
-    return "\n".join(lines)
-
-# =========================================================
-# 3.2) ICHIMOKU HELPERS
-# =========================================================
-def midpoint_high_low(ohlcv: List[List[float]], period: int, end_index: int) -> Optional[float]:
-    start = end_index - period + 1
-    if start < 0:
-        return None
-    window = ohlcv[start:end_index + 1]
-    high = max(c[2] for c in window)
-    low = min(c[3] for c in window)
-    return (high + low) / 2
-
-
-def ichimoku_snapshot(ohlcv: List[List[float]]) -> Optional[dict]:
-    required = ICHIMOKU_SENKOU_B + ICHIMOKU_DISPLACEMENT + 5
-    if len(ohlcv) < required:
-        return None
-
-    last = len(ohlcv) - 1
-    cloud_source = last - ICHIMOKU_DISPLACEMENT
-
-    tenkan_now = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, last)
-    kijun_now = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, last)
-
-    tenkan_cloud = midpoint_high_low(ohlcv, ICHIMOKU_TENKAN, cloud_source)
-    kijun_cloud = midpoint_high_low(ohlcv, ICHIMOKU_KIJUN, cloud_source)
-    span_b_current = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, cloud_source)
-
-    if tenkan_now is None or kijun_now is None or tenkan_cloud is None or kijun_cloud is None or span_b_current is None:
+    if not rows or len(rows) < EMA_PERIOD + 5:
         return None
 
-    span_a_current = (tenkan_cloud + kijun_cloud) / 2
-    cloud_top = max(span_a_current, span_b_current)
-    cloud_bottom = min(span_a_current, span_b_current)
-    close = ohlcv[-1][4]
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
 
-    span_a_future = (tenkan_now + kijun_now) / 2
-    span_b_future = midpoint_high_low(ohlcv, ICHIMOKU_SENKOU_B, last)
-    if span_b_future is None:
-        return None
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["ema200"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["rsi"] = calc_rsi(df["close"], RSI_PERIOD)
+    df["atr"] = calc_atr(df, ATR_PERIOD)
+    df["psar"] = calc_psar(df["high"], df["low"])
 
-    if close > cloud_top:
-        price_vs_cloud = "ABOVE"
-    elif close < cloud_bottom:
-        price_vs_cloud = "BELOW"
+    return df.dropna().reset_index(drop=True)
+
+
+def get_last_closed_candles(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    # Use closed candles: -2 is safer than the still-forming -1 candle.
+    if len(df) >= 3:
+        return df.iloc[-2], df.iloc[-3]
+    return df.iloc[-1], df.iloc[-2]
+
+
+def build_signal(symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
+    last, prev = get_last_closed_candles(df)
+
+    close = safe_float(last["close"])
+    open_ = safe_float(last["open"])
+    high = safe_float(last["high"])
+    low = safe_float(last["low"])
+    ema = safe_float(last["ema200"])
+    rsi = safe_float(last["rsi"], 50.0)
+    prev_rsi = safe_float(prev["rsi"], 50.0)
+    atr = safe_float(last["atr"])
+    psar = safe_float(last["psar"])
+
+    above_ema = close > ema
+    below_ema = close < ema
+    psar_bull = psar < close
+    psar_bear = psar > close
+
+    green_candle = close > open_
+    red_candle = close < open_
+
+    # RSI Recovery for LONG:
+    # Price above EMA200, RSI was weak and recovers upward, SAR supports direction.
+    long_recovery = prev_rsi <= 44 and rsi >= 46 and rsi > prev_rsi
+    long_rejection = 45 <= rsi <= 62 and low <= ema * 1.01 and close > ema and rsi >= prev_rsi
+    long_ok = above_ema and psar_bull and green_candle and (long_recovery or long_rejection)
+
+    # RSI Rejection for SHORT:
+    # Price below EMA200, RSI was strong and rejects downward, SAR supports direction.
+    short_rejection = prev_rsi >= 56 and rsi <= 54 and rsi < prev_rsi
+    short_continuation = 38 <= rsi <= 55 and high >= ema * 0.99 and close < ema and rsi <= prev_rsi
+    short_ok = below_ema and psar_bear and red_candle and (short_rejection or short_continuation)
+
+    if long_ok:
+        action = "LONG"
+        reason = "EMA200 bullish + RSI recovery/rejection + PSAR bullish"
+    elif short_ok:
+        action = "SHORT"
+        reason = "EMA200 bearish + RSI rejection + PSAR bearish"
     else:
-        price_vs_cloud = "INSIDE"
+        action = "NO_TRADE"
+        parts = []
+        if above_ema:
+            parts.append("above EMA200")
+        elif below_ema:
+            parts.append("below EMA200")
+        else:
+            parts.append("near EMA200")
 
-    tk_bias = "BULL" if tenkan_now > kijun_now else "BEAR" if tenkan_now < kijun_now else "FLAT"
-    future_cloud_bias = "BULL" if span_a_future > span_b_future else "BEAR" if span_a_future < span_b_future else "FLAT"
-    cloud_thickness = abs(cloud_top - cloud_bottom) / close if close > 0 else 999
+        parts.append("PSAR bull" if psar_bull else "PSAR bear")
+        parts.append(f"RSI {rsi:.1f}")
+        reason = " | ".join(parts)
 
     return {
-        "tenkan": tenkan_now,
-        "kijun": kijun_now,
-        "span_a_current": span_a_current,
-        "span_b_current": span_b_current,
-        "cloud_top": cloud_top,
-        "cloud_bottom": cloud_bottom,
-        "price_vs_cloud": price_vs_cloud,
-        "tk_bias": tk_bias,
-        "future_cloud_bias": future_cloud_bias,
-        "cloud_thickness": cloud_thickness,
-    }
-
-
-def ichimoku_trend(ichi: dict) -> str:
-    if ichi["price_vs_cloud"] == "ABOVE" and ichi["tk_bias"] == "BULL":
-        return "BULL"
-    if ichi["price_vs_cloud"] == "BELOW" and ichi["tk_bias"] == "BEAR":
-        return "BEAR"
-    if ichi["price_vs_cloud"] == "INSIDE":
-        return "RANGE"
-    return "MIXED"
-
-
-def candle_strength(ohlcv: List[List[float]]) -> dict:
-    if len(ohlcv) < 3:
-        return {"body_ratio": 0.0, "direction": "FLAT"}
-    o, h, l, c = ohlcv[-1][1], ohlcv[-1][2], ohlcv[-1][3], ohlcv[-1][4]
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    body_ratio = body / rng
-    direction = "BULL" if c > o else "BEAR" if c < o else "FLAT"
-    return {"body_ratio": body_ratio, "direction": direction}
-
-
-def recent_structure(ohlcv: List[List[float]], lookback: int = 8) -> str:
-    if len(ohlcv) < lookback + 3:
-        return "UNKNOWN"
-    highs = [c[2] for c in ohlcv[-lookback:]]
-    lows = [c[3] for c in ohlcv[-lookback:]]
-    if highs[-1] > highs[0] and lows[-1] > lows[0]:
-        return "BULL"
-    if highs[-1] < highs[0] and lows[-1] < lows[0]:
-        return "BEAR"
-    return "RANGE"
-
-
-def volume_ok(ohlcv: List[List[float]]) -> Tuple[bool, float]:
-    if len(ohlcv) < VOLUME_SMA_PERIOD + 1:
-        return False, 0.0
-    vols = [safe_float(c[5]) for c in ohlcv]
-    avg = sma(vols[:-1], VOLUME_SMA_PERIOD)
-    current = vols[-1]
-    if not avg or avg <= 0:
-        return False, 0.0
-    ratio = current / avg
-    return ratio >= 0.9, ratio
-
-
-def score_setup(
-    side: str,
-    bars_4h: List[List[float]],
-    bars_1h: List[List[float]],
-    bars_15m: List[List[float]],
-    ichi_4h: dict,
-    ichi_1h: dict,
-    ichi_15m: dict,
-    atr_15m: float,
-    rsi_15m: float,
-) -> dict:
-    close_15m = bars_15m[-1][4]
-    atr_pct = atr_15m / close_15m if close_15m > 0 else 999
-    candle = candle_strength(bars_15m)
-    structure_15m = recent_structure(bars_15m)
-    vol_ok, vol_ratio = volume_ok(bars_15m)
-
-    score = 0
-    reasons = []
-
-    trend_4h = ichimoku_trend(ichi_4h)
-    trend_1h = ichimoku_trend(ichi_1h)
-    trend_15m = ichimoku_trend(ichi_15m)
-
-    want = "BULL" if side == "LONG" else "BEAR"
-    cloud_side = "ABOVE" if side == "LONG" else "BELOW"
-
-    if trend_4h == want:
-        score += 25
-        reasons.append(f"4H {want} فوق/تحت السحابة بشكل واضح")
-    elif ichi_4h["price_vs_cloud"] == cloud_side:
-        score += 15
-        reasons.append("4H السعر في جهة الاتجاه لكن Tenkan/Kijun غير مثالي")
-    elif trend_4h == "RANGE":
-        score -= 25
-        reasons.append("4H داخل السحابة = سوق غير واضح")
-    else:
-        score -= 35
-        reasons.append("4H ضد اتجاه الصفقة")
-
-    if trend_1h == want:
-        score += 20
-        reasons.append(f"1H يؤكد الاتجاه {want}")
-    elif ichi_1h["price_vs_cloud"] == cloud_side:
-        score += 10
-        reasons.append("1H في جهة الاتجاه لكن التأكيد متوسط")
-    elif trend_1h == "RANGE":
-        score -= 15
-        reasons.append("1H داخل السحابة")
-    else:
-        score -= 25
-        reasons.append("1H ضد الصفقة")
-
-    if trend_15m == want:
-        score += 15
-        reasons.append("15m متوافق للدخول")
-    elif ichi_15m["price_vs_cloud"] == cloud_side:
-        score += 8
-        reasons.append("15m فوق/تحت السحابة لكن الزخم متوسط")
-    else:
-        score -= 12
-        reasons.append("15m غير مناسب للدخول")
-
-    distance_kijun = abs(close_15m - ichi_15m["kijun"]) / ichi_15m["kijun"] if ichi_15m["kijun"] > 0 else 999
-    if distance_kijun <= MAX_DISTANCE_FROM_KIJUN_15M:
-        score += 12
-        reasons.append("الدخول قريب من Kijun وليس مطاردة")
-    else:
-        score -= 10
-        reasons.append("السعر بعيد عن Kijun، احتمال الدخول متأخر")
-
-    if ichi_1h["future_cloud_bias"] == want and ichi_15m["tk_bias"] == want:
-        score += 10
-        reasons.append("زخم Ichimoku داعم")
-    elif ichi_15m["tk_bias"] == want:
-        score += 5
-        reasons.append("زخم 15m داعم جزئيًا")
-
-    if candle["direction"] == want and candle["body_ratio"] >= 0.45:
-        score += 8
-        reasons.append("شمعة الدخول قوية")
-    elif candle["direction"] != want:
-        score -= 8
-        reasons.append("شمعة الدخول عكس الاتجاه")
-
-    if structure_15m == want:
-        score += 6
-        reasons.append("هيكل 15m داعم")
-    elif structure_15m == "RANGE":
-        score -= 4
-        reasons.append("هيكل 15m عرضي")
-
-    if vol_ok:
-        score += 5
-        reasons.append(f"الحجم جيد ({vol_ratio:.2f}x)")
-    else:
-        score -= 3
-        reasons.append(f"الحجم ضعيف ({vol_ratio:.2f}x)")
-
-    if MIN_ATR_PERCENT_15M <= atr_pct <= MAX_ATR_PERCENT_15M:
-        score += 4
-        reasons.append("التذبذب مناسب")
-    elif atr_pct > MAX_ATR_PERCENT_15M:
-        score -= 18
-        reasons.append("التذبذب عالي جدًا")
-    else:
-        score -= 10
-        reasons.append("السوق بارد جدًا")
-
-    if side == "LONG":
-        if 42 <= rsi_15m <= 68:
-            score += 5
-            reasons.append("RSI مناسب للونق")
-        elif rsi_15m > 75:
-            score -= 12
-            reasons.append("RSI مرتفع جدًا، احتمال مطاردة")
-    else:
-        if 32 <= rsi_15m <= 58:
-            score += 5
-            reasons.append("RSI مناسب للشورت")
-        elif rsi_15m < 25:
-            score -= 12
-            reasons.append("RSI منخفض جدًا، احتمال مطاردة")
-
-    score = max(0, min(100, score))
-
-    return {
-        "score": score,
-        "reasons": reasons,
-        "atr_pct": atr_pct,
-        "distance_kijun": distance_kijun,
-        "trend_4h": trend_4h,
-        "trend_1h": trend_1h,
-        "trend_15m": trend_15m,
-        "volume_ratio": vol_ratio,
-        "rsi": rsi_15m,
-    }
-
-
-def decide_best_side(
-    bars_4h: List[List[float]],
-    bars_1h: List[List[float]],
-    bars_15m: List[List[float]],
-    ichi_4h: dict,
-    ichi_1h: dict,
-    ichi_15m: dict,
-    atr_15m: float,
-    rsi_15m: float,
-) -> Tuple[Optional[str], dict, dict]:
-    long_score = score_setup("LONG", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
-    short_score = score_setup("SHORT", bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m)
-
-    if long_score["score"] > short_score["score"] and long_score["score"] >= WATCH_SCORE:
-        return "LONG", long_score, short_score
-    if short_score["score"] > long_score["score"] and short_score["score"] >= WATCH_SCORE:
-        return "SHORT", short_score, long_score
-
-    return None, long_score, short_score
-
-# =========================================================
-# 3.3) STATS PERSISTENCE
-# =========================================================
-def empty_daily_stats() -> dict:
-    return {
-        "date": utc_today(),
-        "closed_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "realized_pnl": 0.0,
-        "partial_closes": 0,
-    }
-
-
-def empty_all_stats() -> dict:
-    return {
-        "started_at": utc_now_iso(),
-        "closed_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "realized_pnl": 0.0,
-        "best_win": 0.0,
-        "worst_loss": 0.0,
-        "partial_closes": 0,
-        "by_symbol": {},
-    }
-
-
-def save_stats_to_disk() -> None:
-    try:
-        payload = {
-            "daily_stats": daily_stats,
-            "all_stats": all_stats,
-            "data_dir": str(DATA_DIR),
-            "updated_at": utc_now_iso(),
-        }
-        STATS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.error(f"save_stats_to_disk error: {e}")
-
-
-def load_stats_from_disk() -> None:
-    global daily_stats, all_stats
-
-    if not STATS_FILE.exists():
-        daily_stats = empty_daily_stats()
-        all_stats = empty_all_stats()
-        save_stats_to_disk()
-        return
-
-    try:
-        raw = json.loads(STATS_FILE.read_text(encoding="utf-8"))
-        daily_stats = raw.get("daily_stats") or empty_daily_stats()
-        all_stats = raw.get("all_stats") or empty_all_stats()
-    except Exception as e:
-        logger.error(f"load_stats_from_disk error: {e}")
-        daily_stats = empty_daily_stats()
-        all_stats = empty_all_stats()
-        save_stats_to_disk()
-
-    daily_stats.setdefault("date", utc_today())
-    daily_stats.setdefault("closed_trades", 0)
-    daily_stats.setdefault("wins", 0)
-    daily_stats.setdefault("losses", 0)
-    daily_stats.setdefault("realized_pnl", 0.0)
-    daily_stats.setdefault("partial_closes", 0)
-
-    all_stats.setdefault("started_at", utc_now_iso())
-    all_stats.setdefault("closed_trades", 0)
-    all_stats.setdefault("wins", 0)
-    all_stats.setdefault("losses", 0)
-    all_stats.setdefault("realized_pnl", 0.0)
-    all_stats.setdefault("best_win", 0.0)
-    all_stats.setdefault("worst_loss", 0.0)
-    all_stats.setdefault("partial_closes", 0)
-    all_stats.setdefault("by_symbol", {})
-
-    save_stats_to_disk()
-
-
-def reset_daily_stats_if_needed() -> None:
-    global daily_stats
-    today = utc_today()
-    if daily_stats.get("date") != today:
-        daily_stats = empty_daily_stats()
-        save_stats_to_disk()
-
-
-def update_symbol_stats(symbol: str, pnl_pct: float) -> None:
-    symbol_stats = all_stats["by_symbol"].get(symbol, {
-        "closed_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "realized_pnl": 0.0,
-        "best_win": 0.0,
-        "worst_loss": 0.0,
-    })
-
-    symbol_stats["closed_trades"] += 1
-    symbol_stats["realized_pnl"] += pnl_pct
-
-    if pnl_pct >= 0:
-        symbol_stats["wins"] += 1
-        symbol_stats["best_win"] = max(safe_float(symbol_stats.get("best_win", 0.0)), pnl_pct)
-    else:
-        symbol_stats["losses"] += 1
-        symbol_stats["worst_loss"] = min(safe_float(symbol_stats.get("worst_loss", 0.0)), pnl_pct)
-
-    all_stats["by_symbol"][symbol] = symbol_stats
-
-
-def estimate_pnl_pct(entry_price: float, exit_price: float, side: str) -> float:
-    if entry_price <= 0:
-        return 0.0
-    if side == "LONG":
-        return ((exit_price - entry_price) / entry_price) * 100
-    return ((entry_price - exit_price) / entry_price) * 100
-
-
-def record_closed_trade(symbol: str, entry_price: float, exit_price: float, side: str, reason: str = "Closed") -> float:
-    reset_daily_stats_if_needed()
-    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
-
-    daily_stats["closed_trades"] += 1
-    daily_stats["realized_pnl"] += pnl_pct
-    if pnl_pct >= 0:
-        daily_stats["wins"] += 1
-    else:
-        daily_stats["losses"] += 1
-
-    all_stats["closed_trades"] += 1
-    all_stats["realized_pnl"] += pnl_pct
-    if pnl_pct >= 0:
-        all_stats["wins"] += 1
-        all_stats["best_win"] = max(safe_float(all_stats.get("best_win", 0.0)), pnl_pct)
-    else:
-        all_stats["losses"] += 1
-        all_stats["worst_loss"] = min(safe_float(all_stats.get("worst_loss", 0.0)), pnl_pct)
-
-    update_symbol_stats(symbol, pnl_pct)
-    save_stats_to_disk()
-
-    append_journal("FULL_CLOSE", {
         "symbol": symbol,
-        "side": side,
+        "action": action,
         "reason": reason,
-        "entry": entry_price,
-        "exit": exit_price,
-        "pnl_pct": pnl_pct,
-    })
-    return pnl_pct
+        "close": round(close, 8),
+        "ema200": round(ema, 8),
+        "rsi": round(rsi, 2),
+        "prev_rsi": round(prev_rsi, 2),
+        "atr": round(atr, 8),
+        "psar": round(psar, 8),
+        "candle_time": str(last.get("datetime", "")),
+        "checked_at": utc_now(),
+    }
 
 
-def record_partial_close(symbol: str, side: str, stage: str, entry_price: float, exit_price: float, portion: float) -> float:
-    reset_daily_stats_if_needed()
-    pnl_pct = estimate_pnl_pct(entry_price, exit_price, side)
-    daily_stats["partial_closes"] += 1
-    all_stats["partial_closes"] += 1
-    save_stats_to_disk()
-    append_journal("PARTIAL_CLOSE", {
+# =========================================================
+# 7) POSITIONS, BALANCE, ORDERS
+# =========================================================
+
+def get_usdt_balance() -> Dict[str, float]:
+    with EXCHANGE_LOCK:
+        balance = exchange.fetch_balance(params={"type": "swap"})
+
+    usdt = balance.get("USDT", {}) if isinstance(balance, dict) else {}
+    total = safe_float(usdt.get("total"), 0.0)
+    free = safe_float(usdt.get("free"), 0.0)
+    used = safe_float(usdt.get("used"), 0.0)
+
+    # Some exchanges keep futures values in info.
+    if total <= 0 and isinstance(balance, dict):
+        total = safe_float(balance.get("total", {}).get("USDT"), total)
+        free = safe_float(balance.get("free", {}).get("USDT"), free)
+        used = safe_float(balance.get("used", {}).get("USDT"), used)
+
+    return {"total": total, "free": free, "used": used}
+
+
+def fetch_ticker_price(symbol: str) -> float:
+    with EXCHANGE_LOCK:
+        ticker = exchange.fetch_ticker(symbol)
+    for key in ("last", "mark", "close", "bid", "ask"):
+        price = safe_float(ticker.get(key), 0.0)
+        if price > 0:
+            return price
+    raise RuntimeError(f"Could not fetch valid price for {symbol}")
+
+
+def fetch_positions_safe(symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    with EXCHANGE_LOCK:
+        try:
+            positions = exchange.fetch_positions(symbols or SYMBOLS)
+        except TypeError:
+            positions = exchange.fetch_positions()
+        except Exception as exc:
+            logger.warning("fetch_positions failed: %s", exc)
+            return []
+
+    parsed: List[Dict[str, Any]] = []
+    for p in positions or []:
+        pp = parse_position(p)
+        if pp and pp["contracts"] > 0:
+            parsed.append(pp)
+    return parsed
+
+
+def parse_position(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    info = pos.get("info", {}) or {}
+
+    symbol = pos.get("symbol") or info.get("symbol") or info.get("currency")
+    if not symbol:
+        return None
+
+    # Normalize BingX raw symbol if needed.
+    symbol = normalize_symbol(str(symbol).replace("-", "/"))
+
+    contracts = safe_float(pos.get("contracts"), 0.0)
+    if contracts <= 0:
+        # Fallbacks for different raw API shapes.
+        for k in ("positionAmt", "positionAmtAbs", "availableAmt", "holdingAmount", "size", "qty", "quantity"):
+            contracts = abs(safe_float(info.get(k), 0.0))
+            if contracts > 0:
+                break
+
+    if contracts <= 0:
+        return None
+
+    side_raw = str(pos.get("side") or info.get("side") or info.get("positionSide") or "").lower()
+    amount_signed = safe_float(info.get("positionAmt"), 0.0)
+
+    if "short" in side_raw or side_raw == "sell" or amount_signed < 0:
+        side = "SHORT"
+    elif "long" in side_raw or side_raw == "buy" or amount_signed > 0:
+        side = "LONG"
+    else:
+        # Last fallback: infer from notional if available.
+        side = "LONG"
+
+    entry = safe_float(pos.get("entryPrice"), 0.0)
+    if entry <= 0:
+        for k in ("avgPrice", "averagePrice", "entryPrice", "avgOpenPrice"):
+            entry = safe_float(info.get(k), 0.0)
+            if entry > 0:
+                break
+
+    mark = safe_float(pos.get("markPrice"), 0.0)
+    if mark <= 0:
+        for k in ("markPrice", "latestPrice", "lastPrice"):
+            mark = safe_float(info.get(k), 0.0)
+            if mark > 0:
+                break
+
+    leverage = safe_float(pos.get("leverage"), safe_float(info.get("leverage"), STATE.get("leverage", NORMAL_LEVERAGE)))
+    unrealized = safe_float(pos.get("unrealizedPnl"), safe_float(info.get("unrealizedPnl"), 0.0))
+
+    meta = OPEN_META.get(symbol, {})
+    sl = safe_float(meta.get("sl"), 0.0)
+
+    if mark <= 0:
+        try:
+            mark = fetch_ticker_price(symbol)
+        except Exception:
+            mark = entry
+
+    pnl_pct = calc_pnl_pct(side, entry, mark, leverage)
+
+    return {
         "symbol": symbol,
         "side": side,
-        "stage": stage,
-        "entry": entry_price,
-        "exit": exit_price,
-        "portion": portion,
+        "contracts": contracts,
+        "entry": entry,
+        "mark": mark,
+        "leverage": leverage,
+        "unrealized": unrealized,
         "pnl_pct": pnl_pct,
-    })
-    return pnl_pct
+        "sl": sl,
+        "raw": pos,
+    }
 
 
-def build_today_stats_text() -> str:
-    reset_daily_stats_if_needed()
-    win_rate = 0.0
-    if daily_stats["closed_trades"] > 0:
-        win_rate = (daily_stats["wins"] / daily_stats["closed_trades"]) * 100
-
-    return (
-        f"📈 إحصائيات اليوم\n"
-        f"التاريخ: {daily_stats['date']}\n"
-        f"الصفقات المغلقة نهائيًا: {daily_stats['closed_trades']}\n"
-        f"الإغلاقات الجزئية TP: {daily_stats.get('partial_closes', 0)}\n"
-        f"الرابحة: {daily_stats['wins']}\n"
-        f"الخاسرة: {daily_stats['losses']}\n"
-        f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL% تقريبي: {daily_stats['realized_pnl']:.2f}%\n"
-        f"ملاحظة: هذا PnL% سعري تقريبي، والرصيد الحقيقي يعتمد على الرسوم والتمويل وحجم الصفقة."
-    )
+def calc_pnl_pct(side: str, entry: float, exit_price: float, leverage: float) -> float:
+    if entry <= 0 or exit_price <= 0:
+        return 0.0
+    direction = 1.0 if side.upper() == "LONG" else -1.0
+    raw_pct = ((exit_price - entry) / entry) * direction * 100.0
+    return round(raw_pct * max(leverage, 1.0), 4)
 
 
-def build_all_stats_text() -> str:
-    total = all_stats["closed_trades"]
-    wins = all_stats["wins"]
-    losses = all_stats["losses"]
-    pnl = all_stats["realized_pnl"]
-    best_win = all_stats["best_win"]
-    worst_loss = all_stats["worst_loss"]
+def calc_order_amount(symbol: str, entry: float, sl: float, equity: float, leverage: int, risk_pct: float) -> float:
+    if entry <= 0 or sl <= 0 or equity <= 0:
+        return 0.0
 
-    win_rate = 0.0
-    if total > 0:
-        win_rate = (wins / total) * 100
+    stop_pct = abs(entry - sl) / entry
+    if stop_pct <= 0:
+        return 0.0
 
-    return (
-        f"📊 الإحصائيات الكاملة\n"
-        f"منذ: {all_stats['started_at'][:10]}\n"
-        f"إجمالي الصفقات المغلقة نهائيًا: {total}\n"
-        f"الإغلاقات الجزئية TP: {all_stats.get('partial_closes', 0)}\n"
-        f"الرابحة: {wins}\n"
-        f"الخاسرة: {losses}\n"
-        f"نسبة النجاح: {win_rate:.2f}%\n"
-        f"إجمالي PnL% تقريبي: {pnl:.2f}%\n"
-        f"أفضل صفقة: {best_win:.2f}%\n"
-        f"أسوأ صفقة: {worst_loss:.2f}%\n"
-        f"مسار الحفظ: {DATA_DIR}"
-    )
+    risk_usdt = equity * (risk_pct / 100.0)
+    notional_by_risk = risk_usdt / stop_pct
+    notional_cap = equity * leverage * POSITION_EQUITY_CAP
+    notional = min(notional_by_risk, notional_cap)
 
+    if notional < MIN_NOTIONAL_USDT:
+        logger.warning("Notional below minimum: %.4f < %.4f", notional, MIN_NOTIONAL_USDT)
+        return 0.0
 
-def build_best_symbols_text(limit: int = 5) -> str:
-    stats_by_symbol = all_stats.get("by_symbol", {})
-    if not stats_by_symbol:
-        return "📌 لا توجد بيانات صفقات كافية بعد."
+    amount = notional / entry
 
-    ranked = sorted(
-        stats_by_symbol.items(),
-        key=lambda item: safe_float(item[1].get("realized_pnl", 0.0)),
-        reverse=True,
-    )[:limit]
+    with EXCHANGE_LOCK:
+        try:
+            precise = exchange.amount_to_precision(symbol, amount)
+            amount = safe_float(precise, 0.0)
+        except Exception:
+            pass
 
-    lines = ["🏆 أفضل العملات أداءً:"]
-    for symbol, data in ranked:
-        total = int(data.get("closed_trades", 0))
-        pnl = safe_float(data.get("realized_pnl", 0.0))
-        wins = int(data.get("wins", 0))
-        losses = int(data.get("losses", 0))
-        win_rate = (wins / total * 100) if total > 0 else 0.0
-        lines.append(
-            f"{symbol} | Trades: {total} | WinRate: {win_rate:.1f}% | PnL: {pnl:.2f}% | W/L: {wins}/{losses}"
-        )
-    return "\n".join(lines)
-
-# =========================================================
-# 4) EXCHANGE WRAPPERS
-# =========================================================
-def fetch_balance_details() -> dict:
-    """Return clearer balance view: free, used, total, unrealized PnL, and estimated equity."""
-    try:
-        bal = exchange.fetch_balance({"type": "swap"})
-        usdt = bal.get("USDT") if isinstance(bal.get("USDT"), dict) else {}
-        free = safe_float(usdt.get("free", 0.0))
-        used = safe_float(usdt.get("used", 0.0))
-        total = safe_float(usdt.get("total", 0.0))
-
-        if free == 0 and isinstance(bal.get("free"), dict):
-            free = safe_float(bal["free"].get("USDT", 0.0))
-        if used == 0 and isinstance(bal.get("used"), dict):
-            used = safe_float(bal["used"].get("USDT", 0.0))
-        if total == 0 and isinstance(bal.get("total"), dict):
-            total = safe_float(bal["total"].get("USDT", 0.0))
-
-        unrealized = 0.0
-        for p in fetch_positions():
-            if safe_float(p.get("contracts", 0)) != 0:
-                unrealized += safe_float(p.get("unrealizedPnl", 0.0))
-
-        equity_est = total + unrealized if total > 0 else free + used + unrealized
-        return {
-            "free": free,
-            "used": used,
-            "total": total,
-            "unrealized_pnl": unrealized,
-            "equity_est": equity_est,
-        }
-    except Exception as e:
-        logger.error(f"fetch_balance_details error: {e}")
-        return {"free": 0.0, "used": 0.0, "total": 0.0, "unrealized_pnl": 0.0, "equity_est": 0.0}
-
-
-def build_balance_text() -> str:
-    b = fetch_balance_details()
-    return (
-        f"💰 الرصيد\n"
-        f"Available / المتاح: {b['free']:.2f} USDT\n"
-        f"Used Margin / المحجوز: {b['used']:.2f} USDT\n"
-        f"Wallet Total / الإجمالي: {b['total']:.2f} USDT\n"
-        f"Open PnL / ربح الصفقات المفتوحة: {b['unrealized_pnl']:.4f} USDT\n"
-        f"Estimated Equity / تقدير الحساب: {b['equity_est']:.2f} USDT\n\n"
-        f"مهم: إذا المتاح ينقص، هذا غالبًا بسبب الهامش المحجوز للصفقات المفتوحة، مو شرط خسارة."
-    )
-
-
-def fetch_balance_usdt() -> float:
-    return fetch_balance_details()["free"]
-
-
-def fetch_positions() -> List[dict]:
-    try:
-        return exchange.fetch_positions(params={"type": "swap"})
-    except Exception as e:
-        logger.error(f"fetch_positions error: {e}")
-        return []
-
-
-def get_symbol_position(symbol: str) -> Optional[dict]:
-    try:
-        positions = exchange.fetch_positions([symbol], params={"type": "swap"})
-        for p in positions:
-            if safe_float(p.get("contracts", 0)) != 0:
-                return p
-        return None
-    except Exception as e:
-        logger.error(f"{symbol}: get_symbol_position error: {e}")
-        return None
+    return amount
 
 
 def count_open_positions() -> int:
-    count = 0
-    for pos in fetch_positions():
-        if safe_float(pos.get("contracts", 0)) != 0:
-            count += 1
-    return count
+    return len(fetch_positions_safe(SYMBOLS))
 
 
-def fetch_ohlcv_safe(symbol: str, timeframe: str, limit: int) -> Optional[List[List[float]]]:
-    try:
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception as e:
-        logger.error(f"{symbol} {timeframe} fetch_ohlcv error: {e}")
-        return None
+def has_open_position(symbol: str) -> bool:
+    for p in fetch_positions_safe([symbol]):
+        if p["symbol"] == symbol:
+            return True
+    return False
 
 
-def set_leverage_and_margin(symbol: str, leverage: int) -> None:
-    try:
-        exchange.set_position_mode(False, symbol)
-    except Exception as e:
-        logger.warning(f"{symbol}: set position mode warning: {e}")
-
-    try:
-        exchange.set_margin_mode(MARGIN_MODE, symbol)
-    except Exception as e:
-        logger.warning(f"{symbol}: set margin mode warning: {e}")
-
-    try:
-        exchange.set_leverage(leverage, symbol, {"side": "BOTH"})
-    except Exception as e:
-        logger.warning(f"{symbol}: set leverage warning: {e}")
+def is_in_cooldown(symbol: str) -> bool:
+    last_ts = safe_float(STATE.get("last_trade_ts", {}).get(symbol), 0.0)
+    if last_ts <= 0:
+        return False
+    return (time.time() - last_ts) < COOLDOWN_MINUTES * 60
 
 
-def get_order_params(reduce_only: bool = False) -> dict:
-    params = {"positionSide": "BOTH"}
+def create_market_order(symbol: str, side: str, amount: float, reduce_only: bool = False) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
     if reduce_only:
         params["reduceOnly"] = True
-    return params
 
-# =========================================================
-# 5) STRATEGY - ICHIMOKU SMART
-# =========================================================
-def build_reason_text(reasons: List[str], limit: int = 4) -> str:
-    if not reasons:
-        return "No detailed reason."
-    return " | ".join(reasons[:limit])
+    with EXCHANGE_LOCK:
+        try:
+            return exchange.create_order(symbol, "market", side, amount, None, params=params)
+        except Exception as first_exc:
+            if not reduce_only:
+                raise
 
-
-def get_market_snapshot(symbol: str) -> Optional[dict]:
-    bars_4h = fetch_ohlcv_safe(symbol, TF_4H, 180)
-    bars_1h = fetch_ohlcv_safe(symbol, TF_1H, 180)
-    bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
-
-    if not bars_4h or not bars_1h or not bars_15m:
-        return None
-
-    ichi_4h = ichimoku_snapshot(bars_4h)
-    ichi_1h = ichimoku_snapshot(bars_1h)
-    ichi_15m = ichimoku_snapshot(bars_15m)
-
-    closes_15m = [b[4] for b in bars_15m]
-    atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
-    rsi_15m = rsi(closes_15m, RSI_PERIOD)
-    ema20_15m = ema(closes_15m, EMA_FAST_PERIOD)
-
-    if not ichi_4h or not ichi_1h or not ichi_15m or atr_15m is None or rsi_15m is None or ema20_15m is None:
-        return None
-
-    best_side, best_score, other_score = decide_best_side(
-        bars_4h, bars_1h, bars_15m, ichi_4h, ichi_1h, ichi_15m, atr_15m, rsi_15m
-    )
-
-    close_15m = bars_15m[-1][4]
-    base = {
-        "symbol": symbol,
-        "bars_4h": bars_4h,
-        "bars_1h": bars_1h,
-        "bars_15m": bars_15m,
-        "close_15m": close_15m,
-        "atr_15m": atr_15m,
-        "rsi_15m": rsi_15m,
-        "ema20_15m": ema20_15m,
-        "ichi_4h": ichi_4h,
-        "ichi_1h": ichi_1h,
-        "ichi_15m": ichi_15m,
-    }
-    # =========================================================
-    # STRONG TREND REGIME FILTER
-    # Require all three timeframes to agree.
-    # This reduces false entries during reversals and choppy markets.
-    # =========================================================
-    trend_4h = ichimoku_trend(ichi_4h)
-    trend_1h = ichimoku_trend(ichi_1h)
-    trend_15m = ichimoku_trend(ichi_15m)
-
-    if best_side == "LONG":
-        if not (
-            trend_4h == "BULL"
-            and trend_1h == "BULL"
-            and trend_15m == "BULL"
-        ):
-            return {
-                **base,
-                "signal": "NO_TRADE",
-                "score": 0,
-                "side": None,
-                "reason": (
-                    f"Regime filter blocked LONG | "
-                    f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
-                ),
-                "reasons": [],
-            }
-
-    elif best_side == "SHORT":
-        if not (
-            trend_4h == "BEAR"
-            and trend_1h == "BEAR"
-            and trend_15m == "BEAR"
-        ):
-            return {
-                **base,
-                "signal": "NO_TRADE",
-                "score": 0,
-                "side": None,
-                "reason": (
-                    f"Regime filter blocked SHORT | "
-                    f"4H={trend_4h}, 1H={trend_1h}, 15m={trend_15m}"
-                ),
-                "reasons": [],
-            }
-
-    if not best_side:
-        long_s = best_score["score"]
-        short_s = other_score["score"]
-        return {
-            **base,
-            "signal": "NO_TRADE",
-            "score": max(long_s, short_s),
-            "side": None,
-            "reason": f"No clean side | LongScore {long_s}/100 | ShortScore {short_s}/100",
-            "reasons": [],
-        }
-
-    score = best_score["score"]
-    reasons = best_score["reasons"]
-    reason_text = build_reason_text(reasons)
-
-    if score >= ENTRY_SCORE:
-        return {**base, "signal": best_side, "side": best_side, "score": score, "reason": f"Ichimoku Smart Score {score}/100 | {reason_text}", "reasons": reasons}
-
-    if score >= WATCH_SCORE:
-        return {**base, "signal": "WATCH", "side": best_side, "score": score, "reason": f"{best_side} setup قريب لكن ليس قوي كفاية | Score {score}/100 | {reason_text}", "reasons": reasons}
-
-    return {**base, "signal": "NO_TRADE", "side": best_side, "score": score, "reason": f"Weak setup | Score {score}/100", "reasons": reasons}
+            # Retry with positionSide BOTH for one-way accounts if required by BingX.
+            try:
+                params["positionSide"] = "BOTH"
+                return exchange.create_order(symbol, "market", side, amount, None, params=params)
+            except Exception:
+                raise first_exc
 
 
-def calculate_trade_plan(symbol: str, snapshot: dict, side: str, balance: float, risk_multiplier: float = 1.0) -> Optional[dict]:
-    entry = snapshot["close_15m"]
-    atr_15m = snapshot["atr_15m"]
-    bars_15m = snapshot["bars_15m"]
-    ichi_15m = snapshot["ichi_15m"]
+def open_position(symbol: str, signal: Dict[str, Any]) -> Tuple[bool, str]:
+    if STATE.get("emergency"):
+        return False, "Emergency mode is active."
+    if not STATE.get("running", True):
+        return False, "Bot is paused."
+    if has_open_position(symbol):
+        return False, f"{symbol}: position already open."
+    if count_open_positions() >= MAX_OPEN_POSITIONS:
+        return False, "Max open positions reached."
+    if is_in_cooldown(symbol):
+        return False, f"{symbol}: cooldown active."
 
-    if entry <= 0 or atr_15m <= 0:
-        return None
+    action = signal.get("action")
+    if action not in ("LONG", "SHORT"):
+        return False, f"{symbol}: no trade signal."
 
-    if side == "LONG":
-        swing_stop = min([b[3] for b in bars_15m[-6:]])
-        cloud_stop = ichi_15m["cloud_bottom"]
-        atr_stop = entry - atr_15m * 1.4
-        stop_loss = min(swing_stop, atr_stop, cloud_stop)
-        risk_per_unit = entry - stop_loss
-        tp1 = entry + risk_per_unit * TP1_R
-        tp2 = entry + risk_per_unit * TP2_R
+    leverage = int(STATE.get("leverage", NORMAL_LEVERAGE))
+    risk_pct = float(STATE.get("risk_pct", NORMAL_RISK_PCT))
+
+    configure_symbol(symbol, leverage)
+
+    entry_price = fetch_ticker_price(symbol)
+    atr = safe_float(signal.get("atr"), 0.0)
+    if atr <= 0:
+        return False, f"{symbol}: ATR unavailable."
+
+    if action == "LONG":
+        sl = entry_price - (ATR_SL_MULT * atr)
+        order_side = "buy"
     else:
-        swing_stop = max([b[2] for b in bars_15m[-6:]])
-        cloud_stop = ichi_15m["cloud_top"]
-        atr_stop = entry + atr_15m * 1.4
-        stop_loss = max(swing_stop, atr_stop, cloud_stop)
-        risk_per_unit = stop_loss - entry
-        tp1 = entry - risk_per_unit * TP1_R
-        tp2 = entry - risk_per_unit * TP2_R
+        sl = entry_price + (ATR_SL_MULT * atr)
+        order_side = "sell"
 
-    if risk_per_unit <= 0:
-        return None
-
-    rr_to_tp2 = abs(tp2 - entry) / risk_per_unit
-    if rr_to_tp2 < MIN_RR:
-        return None
-
-    effective_risk = risk_per_trade * risk_multiplier
-    risk_amount = balance * effective_risk
-    raw_amount = risk_amount / risk_per_unit
-    amount = normalize_amount(symbol, raw_amount)
+    balance = get_usdt_balance()
+    equity = balance["total"] if balance["total"] > 0 else balance["free"]
+    amount = calc_order_amount(symbol, entry_price, sl, equity, leverage, risk_pct)
 
     if amount <= 0:
-        return None
+        return False, f"{symbol}: amount too small."
 
-    return {
-        "entry": normalize_price(symbol, entry),
-        "stop_loss": normalize_price(symbol, stop_loss),
-        "tp1": normalize_price(symbol, tp1),
-        "tp2": normalize_price(symbol, tp2),
+    try:
+        order = create_market_order(symbol, order_side, amount, reduce_only=False)
+    except Exception as exc:
+        logger.exception("Open order failed for %s: %s", symbol, exc)
+        return False, f"{symbol}: open order failed: {exc}"
+
+    avg = safe_float(order.get("average"), 0.0)
+    filled_price = avg if avg > 0 else entry_price
+
+    OPEN_META[symbol] = {
+        "symbol": symbol,
+        "side": action,
+        "entry": filled_price,
         "amount": amount,
-        "risk_amount": risk_amount,
-        "risk_per_unit": risk_per_unit,
-        "effective_risk": effective_risk,
-        "score": snapshot.get("score", 0),
+        "leverage": leverage,
+        "risk_pct": risk_pct,
+        "sl": sl,
+        "atr_entry": atr,
+        "opened_at": utc_now(),
+        "mode": STATE.get("mode", "NORMAL"),
+        "signal": signal,
     }
+    save_open_meta()
+
+    STATE.setdefault("last_trade_ts", {})[symbol] = time.time()
+    save_state()
+
+    msg = (
+        f"✅ صفقة جديدة {action}\n"
+        f"{symbol}\n"
+        f"Entry: {filled_price:.8f}\n"
+        f"Amount: {amount}\n"
+        f"SL: {sl:.8f}\n"
+        f"Leverage: {leverage}x\n"
+        f"Risk: {risk_pct:.2f}%\n"
+        f"Reason: {signal.get('reason')}"
+    )
+    return True, msg
 
 
-def get_exit_score(symbol: str, side: str) -> Optional[dict]:
-    snapshot = get_market_snapshot(symbol)
-    if not snapshot:
-        return None
+def record_closed_trade(
+    symbol: str,
+    side: str,
+    entry: float,
+    exit_price: float,
+    leverage: float,
+    reason: str,
+    amount: float = 0.0,
+    unrealized: float = 0.0,
+) -> Dict[str, Any]:
+    pnl_pct = calc_pnl_pct(side, entry, exit_price, leverage)
 
-    opposite = "SHORT" if side == "LONG" else "LONG"
-    current_score = score_setup(side, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
-    opposite_score = score_setup(opposite, snapshot["bars_4h"], snapshot["bars_1h"], snapshot["bars_15m"], snapshot["ichi_4h"], snapshot["ichi_1h"], snapshot["ichi_15m"], snapshot["atr_15m"], snapshot["rsi_15m"])
+    STATS["total_closed"] = int(STATS.get("total_closed", 0)) + 1
+    if pnl_pct > 0:
+        STATS["wins"] = int(STATS.get("wins", 0)) + 1
+    else:
+        STATS["losses"] = int(STATS.get("losses", 0)) + 1
 
-    return {
-        "current_score": current_score["score"],
-        "opposite_score": opposite_score["score"],
-        "reason": build_reason_text(current_score["reasons"], limit=3),
-        "close": snapshot["close_15m"],
-        "atr_15m": snapshot["atr_15m"],
+    STATS["total_pnl_pct"] = float(STATS.get("total_pnl_pct", 0.0)) + pnl_pct
+
+    if int(STATS.get("total_closed", 0)) == 1:
+        STATS["best_trade_pct"] = pnl_pct
+        STATS["worst_trade_pct"] = pnl_pct
+    else:
+        STATS["best_trade_pct"] = max(float(STATS.get("best_trade_pct", 0.0)), pnl_pct)
+        STATS["worst_trade_pct"] = min(float(STATS.get("worst_trade_pct", 0.0)), pnl_pct)
+
+    trade = {
+        "symbol": symbol,
+        "side": side,
+        "entry": round(entry, 8),
+        "exit": round(exit_price, 8),
+        "amount": amount,
+        "leverage": leverage,
+        "pnl_pct": pnl_pct,
+        "unrealized_pnl_usdt": round(unrealized, 4),
+        "reason": reason,
+        "closed_at": utc_now(),
     }
+    STATS.setdefault("history", []).append(trade)
+    save_stats()
+    return trade
 
-# =========================================================
-# 6) ORDERS / POSITION MANAGEMENT
-# =========================================================
-def open_position(symbol: str, side: str, plan: dict, snapshot: dict) -> bool:
-    order_side = "buy" if side == "LONG" else "sell"
+
+def close_position(symbol: str, reason: str = "manual") -> Tuple[bool, str]:
+    symbol = normalize_symbol(symbol)
+    positions = fetch_positions_safe([symbol])
+    pos = next((p for p in positions if p["symbol"] == symbol), None)
+    if not pos:
+        return False, f"لا توجد صفقة مفتوحة على {symbol}"
+
+    amount = safe_float(pos["contracts"], 0.0)
+    if amount <= 0:
+        return False, f"{symbol}: كمية الصفقة غير صالحة."
+
+    close_side = "sell" if pos["side"] == "LONG" else "buy"
+    exit_price_before = pos["mark"]
+
     try:
-        leverage = get_current_leverage()
-        set_leverage_and_margin(symbol, leverage)
+        order = create_market_order(symbol, close_side, amount, reduce_only=True)
+    except Exception as exc:
+        logger.exception("Close order failed for %s: %s", symbol, exc)
+        return False, f"{symbol}: فشل إغلاق الصفقة: {exc}"
 
-        order = exchange.create_market_order(
-            symbol,
-            order_side,
-            plan["amount"],
-            params=get_order_params(reduce_only=False),
-        )
-        logger.info(f"{symbol}: opened {side} -> {order.get('id')}")
+    exit_price = safe_float(order.get("average"), 0.0)
+    if exit_price <= 0:
+        try:
+            exit_price = fetch_ticker_price(symbol)
+        except Exception:
+            exit_price = exit_price_before
 
-        trade_state[symbol] = {
-            "symbol": symbol,
-            "side": side,
-            "entry": plan["entry"],
-            "stop_loss": plan["stop_loss"],
-            "tp1": plan["tp1"],
-            "tp2": plan["tp2"],
-            "amount": plan["amount"],
-            "tp1_taken": False,
-            "tp2_taken": False,
-            "trailing_active": False,
-            "trailing_stop": None,
-            "opened_at": now_ts(),
-            "entry_score": snapshot.get("score", 0),
-            "entry_reason": snapshot.get("reason", ""),
-            "mode": BOT_MODE,
-            "leverage": leverage,
-            "order_id": order.get("id"),
-        }
-        save_runtime_state()
-        append_journal("OPEN", {
-            "symbol": symbol,
-            "side": side,
-            "entry": plan["entry"],
-            "stop_loss": plan["stop_loss"],
-            "tp1": plan["tp1"],
-            "tp2": plan["tp2"],
-            "amount": plan["amount"],
-            "risk_pct": plan["effective_risk"] * 100,
-            "score": snapshot.get("score", 0),
-            "mode": BOT_MODE,
-            "leverage": leverage,
-        })
-        return True
-    except Exception as e:
-        logger.error(f"{symbol}: open position error: {e}")
-        append_journal("OPEN_FAILED", {"symbol": symbol, "side": side, "error": str(e)})
-        return False
-
-
-def close_position(symbol: str, position: dict, portion: float = 1.0) -> bool:
-    try:
-        contracts = safe_float(position.get("contracts", 0))
-        if contracts <= 0:
-            return False
-
-        amount = normalize_amount(symbol, contracts * portion)
-        if amount <= 0:
-            return False
-
-        side = str(position.get("side", "")).lower()
-        close_side = "sell" if side == "long" else "buy"
-
-        exchange.create_market_order(
-            symbol,
-            close_side,
-            amount,
-            params=get_order_params(reduce_only=True),
-        )
-        return True
-    except Exception as e:
-        logger.error(f"{symbol}: close position error: {e}")
-        append_journal("CLOSE_FAILED", {"symbol": symbol, "portion": portion, "error": str(e)})
-        return False
-
-
-async def notify_close(context: ContextTypes.DEFAULT_TYPE, symbol: str, side: str, reason: str, entry: float, exit_price: float) -> None:
-    pnl_pct = estimate_pnl_pct(entry, exit_price, side)
-    await notify(
-        context,
-        (
-            f"📌 Position Closed\n"
-            f"Symbol: {symbol}\n"
-            f"Side: {side}\n"
-            f"Reason: {reason}\n"
-            f"Entry: {format_num(entry, 6)}\n"
-            f"Exit: {format_num(exit_price, 6)}\n"
-            f"PnL% تقريبي: {format_num(pnl_pct, 2)}%"
-        )
+    trade = record_closed_trade(
+        symbol=symbol,
+        side=pos["side"],
+        entry=pos["entry"],
+        exit_price=exit_price,
+        leverage=pos["leverage"],
+        reason=reason,
+        amount=amount,
+        unrealized=pos.get("unrealized", 0.0),
     )
 
+    if symbol in OPEN_META:
+        OPEN_META.pop(symbol, None)
+        save_open_meta()
 
-async def manage_open_positions(context: ContextTypes.DEFAULT_TYPE):
-    positions = fetch_positions()
+    text = (
+        f"🔒 تم إغلاق الصفقة\n"
+        f"{symbol}\n"
+        f"Side: {pos['side']}\n"
+        f"Entry: {pos['entry']:.8f}\n"
+        f"Exit: {exit_price:.8f}\n"
+        f"PnL: {trade['pnl_pct']:.2f}%\n"
+        f"Reason: {reason}"
+    )
+    return True, text
+
+
+def close_positions_by_filter(kind: str) -> str:
+    positions = fetch_positions_safe(SYMBOLS)
     if not positions:
-        return
+        return "لا توجد صفقات مفتوحة."
 
-    for pos in positions:
-        contracts = safe_float(pos.get("contracts", 0))
-        if contracts == 0:
-            continue
-
-        symbol = pos["symbol"]
-        entry_price = safe_float(pos.get("entryPrice", 0))
-        mark_price = safe_float(pos.get("markPrice", 0))
-        side_raw = str(pos.get("side", "")).lower()
-
-        if entry_price <= 0 or mark_price <= 0:
-            continue
-
-        side = "LONG" if side_raw == "long" else "SHORT"
-
-        state = trade_state.get(symbol)
-        if not state:
-            fallback_sl = entry_price * (0.985 if side == "LONG" else 1.015)
-            fallback_tp1 = entry_price * (1.009 if side == "LONG" else 0.991)
-            fallback_tp2 = entry_price * (1.018 if side == "LONG" else 0.982)
-            trade_state[symbol] = {
-                "symbol": symbol,
-                "side": side,
-                "entry": entry_price,
-                "stop_loss": fallback_sl,
-                "tp1": fallback_tp1,
-                "tp2": fallback_tp2,
-                "amount": contracts,
-                "tp1_taken": False,
-                "tp2_taken": False,
-                "trailing_active": False,
-                "trailing_stop": None,
-                "opened_at": now_ts(),
-                "entry_score": 0,
-                "entry_reason": "Recovered open position",
-                "mode": BOT_MODE,
-                "leverage": get_current_leverage(),
-            }
-            state = trade_state[symbol]
-            save_runtime_state()
-            append_journal("RECOVER_POSITION", {"symbol": symbol, "side": side, "entry": entry_price, "contracts": contracts})
-
-        bars_15m = fetch_ohlcv_safe(symbol, TF_15M, 180)
-        if not bars_15m:
-            continue
-        atr_15m = atr_from_ohlcv(bars_15m, ATR_PERIOD)
-        if atr_15m is None:
-            continue
-
-        exit_info = get_exit_score(symbol, side)
-        current_score = exit_info["current_score"] if exit_info else 100
-        opposite_score = exit_info["opposite_score"] if exit_info else 0
-
-        if side == "LONG":
-            if mark_price <= safe_float(state["stop_loss"]):
-                if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
-                    await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
-                if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
-                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if (not state.get("tp1_taken")) and mark_price >= safe_float(state["tp1"]):
-                if close_position(symbol, pos, 0.5):
-                    state["tp1_taken"] = True
-                    state["stop_loss"] = state["entry"]
-                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
-                    save_runtime_state()
-                    await notify(context, f"✅ TP1 LONG\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
-                    continue
-
-            refreshed = get_symbol_position(symbol) or pos
-            if (not state.get("tp2_taken")) and mark_price >= safe_float(state["tp2"]):
-                if close_position(symbol, refreshed, 0.6):
-                    state["tp2_taken"] = True
-                    state["trailing_active"] = True
-                    state["trailing_stop"] = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
-                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
-                    save_runtime_state()
-                    await notify(context, f"🚀 TP2 LONG\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
-                    continue
-
-            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
-                refreshed = get_symbol_position(symbol) or pos
-                if close_position(symbol, refreshed, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
-                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if state.get("trailing_active"):
-                new_trailing = mark_price - atr_15m * TRAILING_ATR_MULTIPLIER
-                if state.get("trailing_stop") is None:
-                    state["trailing_stop"] = new_trailing
-                else:
-                    state["trailing_stop"] = max(safe_float(state["trailing_stop"]), new_trailing)
-                save_runtime_state()
-
-                if mark_price <= safe_float(state["trailing_stop"]):
-                    refreshed = get_symbol_position(symbol) or pos
-                    if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
-                        await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
-                        trade_state.pop(symbol, None)
-                        set_cooldown(symbol)
-                    continue
-
-        else:
-            if mark_price >= safe_float(state["stop_loss"]):
-                if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, "Stop Loss")
-                    await notify_close(context, symbol, side, "Stop Loss", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if (not state.get("tp1_taken")) and current_score <= EMERGENCY_EXIT_SCORE and opposite_score >= WATCH_SCORE:
-                if close_position(symbol, pos, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Emergency Exit | score {current_score}")
-                    await notify_close(context, symbol, side, f"Smart Emergency Exit | score {current_score}", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if (not state.get("tp1_taken")) and mark_price <= safe_float(state["tp1"]):
-                if close_position(symbol, pos, 0.5):
-                    state["tp1_taken"] = True
-                    state["stop_loss"] = state["entry"]
-                    record_partial_close(symbol, side, "TP1", entry_price, mark_price, 0.5)
-                    save_runtime_state()
-                    await notify(context, f"✅ TP1 SHORT\n{symbol}\nClosed 50%\nSL moved to breakeven\nSmartScore now: {current_score}/100")
-                    continue
-
-            refreshed = get_symbol_position(symbol) or pos
-            if (not state.get("tp2_taken")) and mark_price <= safe_float(state["tp2"]):
-                if close_position(symbol, refreshed, 0.6):
-                    state["tp2_taken"] = True
-                    state["trailing_active"] = True
-                    state["trailing_stop"] = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
-                    record_partial_close(symbol, side, "TP2", entry_price, mark_price, 0.6)
-                    save_runtime_state()
-                    await notify(context, f"🚀 TP2 SHORT\n{symbol}\nClosed 60% of remaining position\nTrailing stop activated\nSmartScore now: {current_score}/100")
-                    continue
-
-            if state.get("tp1_taken") and current_score <= EARLY_EXIT_SCORE and opposite_score > current_score:
-                refreshed = get_symbol_position(symbol) or pos
-                if close_position(symbol, refreshed, 1.0):
-                    record_closed_trade(symbol, entry_price, mark_price, side, f"Smart Weakness Exit | score {current_score}")
-                    await notify_close(context, symbol, side, f"Smart Weakness Exit | score {current_score}", entry_price, mark_price)
-                    trade_state.pop(symbol, None)
-                    set_cooldown(symbol)
-                continue
-
-            if state.get("trailing_active"):
-                new_trailing = mark_price + atr_15m * TRAILING_ATR_MULTIPLIER
-                if state.get("trailing_stop") is None:
-                    state["trailing_stop"] = new_trailing
-                else:
-                    state["trailing_stop"] = min(safe_float(state["trailing_stop"]), new_trailing)
-                save_runtime_state()
-
-                if mark_price >= safe_float(state["trailing_stop"]):
-                    refreshed = get_symbol_position(symbol) or pos
-                    if close_position(symbol, refreshed, 1.0):
-                        record_closed_trade(symbol, entry_price, mark_price, side, "Trailing Stop")
-                        await notify_close(context, symbol, side, "Trailing Stop", entry_price, mark_price)
-                        trade_state.pop(symbol, None)
-                        set_cooldown(symbol)
-                    continue
-
-# =========================================================
-# 7) SCAN JOB
-# =========================================================
-async def trading_job(context: ContextTypes.DEFAULT_TYPE):
-    global last_scan_summary, last_signal_summary, bot_paused
-
-    reset_daily_stats_if_needed()
-
-    if bot_paused:
-        last_scan_summary = "Bot is paused."
-        return
-
-    await manage_open_positions(context)
-
-    if count_open_positions() >= MAX_OPEN_POSITIONS:
-        last_scan_summary = "Max open positions reached."
-        logger.info(last_scan_summary)
-        return
-
-    scan_lines = []
-
-    for symbol in SYMBOLS:
-        try:
-            if is_in_cooldown(symbol):
-                scan_lines.append(f"{symbol}: COOLDOWN")
-                continue
-
-            if get_symbol_position(symbol):
-                scan_lines.append(f"{symbol}: ALREADY_OPEN")
-                continue
-
-            snapshot = get_market_snapshot(symbol)
-            if not snapshot:
-                scan_lines.append(f"{symbol}: NO_DATA")
-                continue
-
-            signal = snapshot["signal"]
-            reason = snapshot["reason"]
-            score = snapshot.get("score", 0)
-
-            scan_lines.append(f"{symbol}: {signal} | Score {score}/100 | {reason}")
-            last_signal_summary = f"{symbol}: {signal} | Score {score}/100 | {reason}"
-
-            if signal not in ("LONG", "SHORT"):
-                continue
-
-            entry_side = signal
-
-            balance = fetch_balance_usdt()
-            if balance <= 5:
-                scan_lines.append(f"{symbol}: LOW_BALANCE")
-                continue
-
-            plan = calculate_trade_plan(symbol, snapshot, entry_side, balance, risk_multiplier=1.0)
-            if not plan:
-                scan_lines.append(f"{symbol}: PLAN_REJECTED")
-                continue
-
-            if open_position(symbol, entry_side, plan, snapshot):
-                await notify(
-                    context,
-                    (
-                        f"🚀 Ichimoku Smart Trade Opened\n"
-                        f"Symbol: {symbol}\n"
-                        f"Side: {entry_side}\n"
-                        f"SmartScore: {score}/100\n"
-                        f"Reason: {reason}\n"
-                        f"Entry: {format_num(plan['entry'], 6)}\n"
-                        f"SL: {format_num(plan['stop_loss'], 6)}\n"
-                        f"TP1: {format_num(plan['tp1'], 6)}\n"
-                        f"TP2: {format_num(plan['tp2'], 6)}\n"
-                        f"Amount: {plan['amount']}\n"
-                        f"Risk: {format_num(plan['effective_risk'] * 100, 2)}%\n"
-                        f"Mode: {BOT_MODE}\n"
-                        f"Leverage: {get_current_leverage()}x"
-                    )
-                )
-                scan_lines.append(f"{symbol}: OPENED {entry_side} | Score {score}/100")
-                if count_open_positions() >= MAX_OPEN_POSITIONS:
-                    break
-            else:
-                scan_lines.append(f"{symbol}: OPEN_FAILED")
-
-        except Exception as e:
-            logger.error(f"{symbol}: trading_job error: {e}")
-            scan_lines.append(f"{symbol}: ERROR")
-
-    last_scan_summary = "\n".join(scan_lines[-12:]) if scan_lines else "No scan results."
-    logger.info(f"Scan summary:\n{last_scan_summary}")
-
-# =========================================================
-# 8) TELEGRAM DASHBOARD
-# =========================================================
-def dashboard_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💰 الرصيد", callback_data="dash_balance"),
-            InlineKeyboardButton("📡 الرادار", callback_data="dash_radar"),
-        ],
-        [
-            InlineKeyboardButton("🧠 Normal 3x", callback_data="mode_normal"),
-            InlineKeyboardButton("🔥 Aggressive 5x", callback_data="mode_aggressive"),
-        ],
-        [
-            InlineKeyboardButton("📂 الصفقات", callback_data="dash_positions"),
-            InlineKeyboardButton("📈 اليوم", callback_data="dash_stats"),
-        ],
-        [
-            InlineKeyboardButton("📊 الكل", callback_data="dash_allstats"),
-            InlineKeyboardButton("📒 السجل", callback_data="dash_journal"),
-        ],
-        [
-            InlineKeyboardButton("🏆 الأفضل", callback_data="dash_best"),
-            InlineKeyboardButton("🔎 فحص يدوي", callback_data="dash_scan"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ المخاطرة", callback_data="dash_risk_menu"),
-        ],
-        [
-            InlineKeyboardButton("⏸ إيقاف", callback_data="dash_pause"),
-            InlineKeyboardButton("▶️ تشغيل", callback_data="dash_resume"),
-        ],
-        [
-            InlineKeyboardButton("🛑 إغلاق الكل", callback_data="dash_close_all"),
-            InlineKeyboardButton("✅ إغلاق الرابحة", callback_data="dash_close_winners"),
-        ],
-        [
-            InlineKeyboardButton("❌ إغلاق الخاسرة", callback_data="dash_close_losers"),
-        ],
-    ])
-
-
-def risk_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("0.3%", callback_data="risk_0.003"), InlineKeyboardButton("0.5%", callback_data="risk_0.005")],
-        [InlineKeyboardButton("0.6%", callback_data="risk_0.006"), InlineKeyboardButton("0.75%", callback_data="risk_0.0075")],
-        [InlineKeyboardButton("1.0%", callback_data="risk_0.01"), InlineKeyboardButton("⬅️ رجوع", callback_data="dash_home")],
-    ])
-
-
-async def show_positions(message_target, positions: List[dict]):
-    lines = []
+    results: List[str] = []
     for p in positions:
-        contracts = safe_float(p.get("contracts", 0))
-        if contracts == 0:
-            continue
-        symbol = p["symbol"]
-        state = trade_state.get(symbol, {})
-        extra = ""
-        if state:
-            extra = (
-                f"\nSL: {format_num(safe_float(state.get('stop_loss', 0)), 6)}"
-                f" | TP1: {format_num(safe_float(state.get('tp1', 0)), 6)}"
-                f" | TP2: {format_num(safe_float(state.get('tp2', 0)), 6)}"
-                f" | TP1 taken: {state.get('tp1_taken', False)}"
-                f" | TP2 taken: {state.get('tp2_taken', False)}"
-                f" | Trail: {format_num(safe_float(state.get('trailing_stop', 0)), 6) if state.get('trailing_stop') else '-'}"
-            )
-        lines.append(
-            f"{symbol} | {p.get('side')} | Contracts: {contracts}\n"
-            f"Entry: {format_num(safe_float(p.get('entryPrice', 0)), 6)} | "
-            f"Mark: {format_num(safe_float(p.get('markPrice', 0)), 6)} | "
-            f"UPnL: {format_num(safe_float(p.get('unrealizedPnl', 0)), 4)}"
-            f"{extra}"
-        )
-    if not lines:
-        await message_target.reply_text("لا توجد صفقات مفتوحة.")
-    else:
-        await message_target.reply_text("📂 الصفقات المفتوحة:\n\n" + "\n\n".join(lines[:20]))
-
-
-async def close_by_pnl(update_or_message, mode: str):
-    positions = fetch_positions()
-    count = 0
-
-    for p in positions:
-        contracts = safe_float(p.get("contracts", 0))
-        if contracts == 0:
-            continue
-
-        upnl = safe_float(p.get("unrealizedPnl", 0))
-        symbol = p["symbol"]
-        entry_price = safe_float(p.get("entryPrice", 0))
-        mark_price = safe_float(p.get("markPrice", 0))
-        side_raw = str(p.get("side", "")).lower()
-        side = "LONG" if side_raw == "long" else "SHORT"
-
-        should_close = (
-            (mode == "all") or
-            (mode == "winners" and upnl > 0) or
-            (mode == "losers" and upnl < 0)
-        )
+        should_close = False
+        if kind == "all":
+            should_close = True
+        elif kind == "winning" and p["pnl_pct"] > 0:
+            should_close = True
+        elif kind == "losing" and p["pnl_pct"] < 0:
+            should_close = True
 
         if not should_close:
             continue
 
-        if close_position(symbol, p, 1.0):
-            record_closed_trade(symbol, entry_price, mark_price, side, f"Manual close {mode}")
-            trade_state.pop(symbol, None)
-            set_cooldown(symbol)
-            count += 1
+        ok, msg = close_position(p["symbol"], reason=f"telegram_{kind}")
+        results.append(msg)
 
-    if mode == "all":
-        msg = f"🛑 تم طلب إغلاق {count} صفقة."
-    elif mode == "winners":
-        msg = f"✅ تم طلب إغلاق {count} صفقة رابحة."
+    if not results:
+        if kind == "winning":
+            return "لا توجد صفقات رابحة حالياً."
+        if kind == "losing":
+            return "لا توجد صفقات خاسرة حالياً."
+        return "لا توجد صفقات مطابقة."
+
+    return "\n\n".join(results)
+
+
+# =========================================================
+# 8) POSITION MANAGEMENT: ATR SL + PSAR TRAIL
+# =========================================================
+
+def ensure_meta_for_position(pos: Dict[str, Any]) -> None:
+    symbol = pos["symbol"]
+    if symbol in OPEN_META:
+        return
+
+    df = fetch_ohlcv_df(symbol)
+    atr = 0.0
+    if df is not None and len(df):
+        last, _ = get_last_closed_candles(df)
+        atr = safe_float(last.get("atr"), 0.0)
+
+    entry = pos["entry"]
+    if atr <= 0:
+        atr = entry * 0.01
+
+    if pos["side"] == "LONG":
+        sl = entry - ATR_SL_MULT * atr
     else:
-        msg = f"❌ تم طلب إغلاق {count} صفقة خاسرة."
+        sl = entry + ATR_SL_MULT * atr
 
-    await update_or_message.reply_text(msg)
+    OPEN_META[symbol] = {
+        "symbol": symbol,
+        "side": pos["side"],
+        "entry": entry,
+        "amount": pos["contracts"],
+        "leverage": pos["leverage"],
+        "risk_pct": STATE.get("risk_pct", NORMAL_RISK_PCT),
+        "sl": sl,
+        "atr_entry": atr,
+        "opened_at": utc_now(),
+        "mode": STATE.get("mode", "NORMAL"),
+        "reconstructed": True,
+    }
+    save_open_meta()
+
+
+def update_trailing_stop(pos: Dict[str, Any]) -> Tuple[bool, str]:
+    symbol = pos["symbol"]
+    ensure_meta_for_position(pos)
+
+    meta = OPEN_META.get(symbol, {})
+    old_sl = safe_float(meta.get("sl"), pos.get("sl", 0.0))
+
+    df = fetch_ohlcv_df(symbol)
+    if df is None or len(df) < 5:
+        return False, f"{symbol}: no data for trailing."
+
+    last, _ = get_last_closed_candles(df)
+    close = safe_float(last["close"])
+    atr = safe_float(last["atr"])
+    psar = safe_float(last["psar"])
+    mark = pos["mark"]
+
+    side = pos["side"]
+    new_sl = old_sl
+
+    if side == "LONG":
+        atr_sl = mark - ATR_TRAIL_MULT * atr
+        candidates = [old_sl]
+        if psar < mark:
+            candidates.append(psar)
+        if atr_sl < mark:
+            candidates.append(atr_sl)
+        new_sl = max(candidates)
+
+        # Exit if market touches SL or PSAR flips bearish.
+        if mark <= new_sl:
+            return True, f"ATR/PSAR SL hit at {mark:.8f} <= {new_sl:.8f}"
+        if psar > close:
+            return True, "PSAR flipped bearish"
+
+    else:
+        atr_sl = mark + ATR_TRAIL_MULT * atr
+        candidates = [old_sl if old_sl > 0 else pos["entry"] + ATR_SL_MULT * atr]
+        if psar > mark:
+            candidates.append(psar)
+        if atr_sl > mark:
+            candidates.append(atr_sl)
+        new_sl = min(candidates)
+
+        # Exit if market touches SL or PSAR flips bullish.
+        if mark >= new_sl:
+            return True, f"ATR/PSAR SL hit at {mark:.8f} >= {new_sl:.8f}"
+        if psar < close:
+            return True, "PSAR flipped bullish"
+
+    if new_sl > 0 and abs(new_sl - old_sl) > 0:
+        OPEN_META[symbol]["sl"] = float(new_sl)
+        OPEN_META[symbol]["last_trail_update"] = utc_now()
+        save_open_meta()
+
+    return False, f"{symbol}: trailing ok. SL {old_sl:.8f} -> {new_sl:.8f}"
+
+
+def cleanup_missing_positions(current_positions: List[Dict[str, Any]]) -> List[str]:
+    current_symbols = {p["symbol"] for p in current_positions}
+    removed: List[str] = []
+    for symbol in list(OPEN_META.keys()):
+        if symbol not in current_symbols:
+            OPEN_META.pop(symbol, None)
+            removed.append(symbol)
+    if removed:
+        save_open_meta()
+    return removed
+
 
 # =========================================================
-# 9) COMMANDS
+# 9) TELEGRAM HELPERS + DASHBOARD
 # =========================================================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat:
-        context.bot_data["chat_id"] = str(update.effective_chat.id)
-    await update.message.reply_text("🤖 Ichimoku Smart Bot جاهز.\nاستخدم لوحة التحكم:", reply_markup=dashboard_kb())
+
+DASHBOARD_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["الرصيد 💰", "الصفقات 📁", "الإحصائيات 📊"],
+        ["الرادار 📡", "تشغيل ▶️", "إيقاف ⏸️"],
+        ["Normal 3x 🧠", "Aggressive 5x 🔥"],
+        ["إغلاق الكل 🛑", "إغلاق الرابحة ✅", "إغلاق الخاسرة ❌"],
+        ["طوارئ 🚨"],
+    ],
+    resize_keyboard=True,
+)
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    paused = "نعم" if bot_paused else "لا"
-    b = fetch_balance_details()
-    await update.message.reply_text(
-        f"📊 الحالة\n"
-        f"الوضع: {get_mode_text()}\n"
-        f"الاستراتيجية: Ichimoku Smart Score\n"
-        f"متوقف: {paused}\n"
-        f"Available: {b['free']:.2f} USDT\n"
-        f"Used Margin: {b['used']:.2f} USDT\n"
-        f"Wallet Total: {b['total']:.2f} USDT\n"
-        f"Open PnL: {b['unrealized_pnl']:.4f} USDT\n"
-        f"Estimated Equity: {b['equity_est']:.2f} USDT\n"
-        f"الصفقات المفتوحة: {count_open_positions()}/{MAX_OPEN_POSITIONS}\n"
-        f"المخاطرة الحالية: {risk_per_trade * 100:.2f}%\n"
-        f"نقطة الدخول: {ENTRY_SCORE}/100\n"
-        f"DATA_DIR: {DATA_DIR}\n"
-        f"آخر إشارة: {last_signal_summary}\n\n"
-        f"آخر فحص:\n{last_scan_summary}",
-        reply_markup=dashboard_kb(),
+def authorized(update: Update) -> bool:
+    if not update.effective_chat:
+        return False
+    return str(update.effective_chat.id) == str(ENV_CHAT_ID)
+
+
+async def reply(update: Update, text: str) -> None:
+    if update.message:
+        await update.message.reply_text(text, reply_markup=DASHBOARD_KEYBOARD)
+
+
+async def send_to_owner(app_or_context: Any, text: str) -> None:
+    try:
+        bot = app_or_context.bot if hasattr(app_or_context, "bot") else app_or_context.application.bot
+        await bot.send_message(chat_id=ENV_CHAT_ID, text=text)
+    except Exception as exc:
+        logger.warning("Telegram send failed: %s", exc)
+
+
+def format_balance() -> str:
+    bal = get_usdt_balance()
+    return (
+        "💰 الرصيد\n"
+        f"Total: {bal['total']:.2f} USDT\n"
+        f"Free: {bal['free']:.2f} USDT\n"
+        f"Used: {bal['used']:.2f} USDT\n"
+        f"Mode: {STATE.get('mode')} ({STATE.get('leverage')}x)\n"
+        f"Risk: {STATE.get('risk_pct')}%\n"
+        f"Bot: {'ON' if STATE.get('running') else 'OFF'}"
     )
 
 
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_balance_text())
+def format_positions() -> str:
+    positions = fetch_positions_safe(SYMBOLS)
+    if not positions:
+        return "📁 لا توجد صفقات مفتوحة حالياً."
+
+    lines = ["📁 الصفقات المفتوحة:"]
+    for p in positions:
+        meta = OPEN_META.get(p["symbol"], {})
+        sl = safe_float(meta.get("sl"), p.get("sl", 0.0))
+        lines.append(
+            "\n"
+            f"{p['symbol']}\n"
+            f"Side: {p['side']}\n"
+            f"Entry: {p['entry']:.8f}\n"
+            f"Now: {p['mark']:.8f}\n"
+            f"SL: {sl:.8f}\n"
+            f"Lev: {p['leverage']}x\n"
+            f"PnL: {p['unrealized']:.2f} USDT ({p['pnl_pct']:.2f}%)"
+        )
+    return "\n".join(lines)
 
 
-async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_positions(update.message, fetch_positions())
+def format_stats() -> str:
+    total = int(STATS.get("total_closed", 0))
+    wins = int(STATS.get("wins", 0))
+    losses = int(STATS.get("losses", 0))
+    return (
+        "📊 الإحصائيات الكاملة\n"
+        f"منذ: {STATS.get('since')}\n"
+        f"إجمالي الصفقات المغلقة: {total}\n"
+        f"الرابحة: {wins}\n"
+        f"الخاسرة: {losses}\n"
+        f"نسبة النجاح: {float(STATS.get('win_rate', 0.0)):.2f}%\n"
+        f"إجمالي PnL%: {float(STATS.get('total_pnl_pct', 0.0)):.2f}%\n"
+        f"أفضل صفقة: {float(STATS.get('best_trade_pct', 0.0)):.2f}%\n"
+        f"أسوأ صفقة: {float(STATS.get('worst_trade_pct', 0.0)):.2f}%\n"
+        f"آخر تحديث: {STATS.get('updated_at')}"
+    )
 
 
-async def cmd_radar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
+def format_radar() -> str:
+    last_scan = STATE.get("last_scan", {})
+    if not last_scan:
+        return "📡 لا توجد قراءات بعد. انتظر أول دورة فحص."
 
+    lines = ["📡 آخر فحص:"]
+    for symbol in SYMBOLS:
+        s = last_scan.get(symbol)
+        if not s:
+            lines.append(f"{symbol}: لم يتم فحصه بعد")
+            continue
+        lines.append(
+            f"{symbol}: {s.get('action')} | {s.get('reason')} | "
+            f"RSI {s.get('rsi')} | Price {s.get('close')}"
+        )
+    return "\n".join(lines)
 
-async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_paused
-    bot_paused = True
-    await update.message.reply_text("⏸ تم إيقاف البوت.")
-
-
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_paused
-    bot_paused = False
-    await update.message.reply_text("▶️ تم تشغيل البوت.")
-
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔎 جاري الفحص اليدوي...")
-    await trading_job(context)
-    await update.message.reply_text(f"تم.\n\n{last_scan_summary}")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_today_stats_text())
-
-
-async def cmd_allstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_all_stats_text())
-
-
-async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_best_symbols_text())
-
-
-async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_journal_text(12))
-
-
-async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await close_by_pnl(update.message, "all")
 
 # =========================================================
-# 10) CALLBACKS
+# 10) TELEGRAM COMMANDS
 # =========================================================
-async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_paused, risk_per_trade, BOT_MODE
 
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "dash_home":
-        await query.message.reply_text("🎛 لوحة التحكم:", reply_markup=dashboard_kb())
-
-    elif data == "mode_normal":
-        BOT_MODE = "NORMAL"
-        await query.message.reply_text("🧠 تم تفعيل الوضع العادي NORMAL (3x)")
-
-    elif data == "mode_aggressive":
-        BOT_MODE = "AGGRESSIVE"
-        await query.message.reply_text("🔥 تم تفعيل الوضع الهجومي AGGRESSIVE (5x)")
-
-    elif data == "dash_balance":
-        await query.message.reply_text(build_balance_text())
-
-    elif data == "dash_radar":
-        await query.message.reply_text(f"📡 آخر فحص:\n{last_scan_summary}")
-
-    elif data == "dash_positions":
-        await show_positions(query.message, fetch_positions())
-
-    elif data == "dash_stats":
-        await query.message.reply_text(build_today_stats_text())
-
-    elif data == "dash_allstats":
-        await query.message.reply_text(build_all_stats_text())
-
-    elif data == "dash_journal":
-        await query.message.reply_text(build_journal_text(12))
-
-    elif data == "dash_best":
-        await query.message.reply_text(build_best_symbols_text())
-
-    elif data == "dash_scan":
-        await query.message.reply_text("🔎 جاري الفحص اليدوي...")
-        await trading_job(context)
-        await query.message.reply_text(f"تم.\n\n{last_scan_summary}")
-
-    elif data == "dash_pause":
-        bot_paused = True
-        await query.message.reply_text("⏸ تم إيقاف البوت.")
-
-    elif data == "dash_resume":
-        bot_paused = False
-        await query.message.reply_text("▶️ تم تشغيل البوت.")
-
-    elif data == "dash_risk_menu":
-        await query.message.reply_text(f"⚙️ اختر المخاطرة الحالية\nالحالية: {risk_per_trade * 100:.2f}%", reply_markup=risk_kb())
-
-    elif data.startswith("risk_"):
-        try:
-            risk_per_trade = float(data.split("_", 1)[1])
-            await query.message.reply_text(f"✅ تم تغيير المخاطرة إلى {risk_per_trade * 100:.2f}%")
-        except Exception:
-            await query.message.reply_text("❌ فشل تغيير المخاطرة.")
-
-    elif data == "dash_close_all":
-        await close_by_pnl(query.message, "all")
-
-    elif data == "dash_close_winners":
-        await close_by_pnl(query.message, "winners")
-
-    elif data == "dash_close_losers":
-        await close_by_pnl(query.message, "losers")
-
-# =========================================================
-# 11) HEALTH
-# =========================================================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ICHIMOKU_SMART_BOT_LIVE")
-
-    def log_message(self, format, *args):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
         return
+    await reply(
+        update,
+        "✅ بوت BingX Futures شغال.\n"
+        "استخدم الأزرار للتحكم.\n\n"
+        "أوامر الإغلاق المحدد:\n"
+        "/close BTC\n"
+        "/close ETH\n"
+        "/close SOL"
+    )
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    await reply(update, format_radar())
+
+
+async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    await reply(update, format_balance())
+
+
+async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    await reply(update, format_positions())
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    await reply(update, format_stats())
+
+
+def coin_to_symbol(coin: str) -> Optional[str]:
+    coin = coin.strip().upper().replace("/", "")
+    if not coin:
+        return None
+
+    for symbol in SYMBOLS:
+        base = symbol.split("/")[0].upper()
+        if coin == base or coin == symbol.upper():
+            return symbol
+
+    # Fallback for user commands like /close BTC even if SYMBOLS changed.
+    candidate = f"{coin}/USDT:USDT"
+    return normalize_symbol(candidate)
+
+
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+
+    if not context.args:
+        await reply(update, "اكتب العملة بعد الأمر، مثال: /close BTC")
+        return
+
+    symbol = coin_to_symbol(context.args[0])
+    if not symbol:
+        await reply(update, "لم أتعرف على العملة.")
+        return
+
+    ok, msg = close_position(symbol, reason="telegram_command")
+    await reply(update, msg)
+
+
+async def dashboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    if not update.message:
+        return
+
+    text = (update.message.text or "").strip()
+
+    try:
+        if text == "الرصيد 💰":
+            await reply(update, format_balance())
+
+        elif text == "الصفقات 📁":
+            await reply(update, format_positions())
+
+        elif text == "الإحصائيات 📊":
+            await reply(update, format_stats())
+
+        elif text == "الرادار 📡":
+            await reply(update, format_radar())
+
+        elif text == "تشغيل ▶️":
+            STATE["running"] = True
+            STATE["emergency"] = False
+            save_state()
+            await reply(update, "▶️ تم تشغيل البوت.")
+
+        elif text == "إيقاف ⏸️":
+            STATE["running"] = False
+            save_state()
+            await reply(update, "⏸️ تم إيقاف فتح صفقات جديدة. إدارة الصفقات الحالية ما زالت تعمل.")
+
+        elif text == "Normal 3x 🧠":
+            STATE["mode"] = "NORMAL"
+            STATE["leverage"] = NORMAL_LEVERAGE
+            STATE["risk_pct"] = NORMAL_RISK_PCT
+            save_state()
+            for s in SYMBOLS:
+                configure_symbol(s, NORMAL_LEVERAGE)
+            await reply(update, f"🧠 تم تفعيل Normal {NORMAL_LEVERAGE}x | Risk {NORMAL_RISK_PCT}%")
+
+        elif text == "Aggressive 5x 🔥":
+            STATE["mode"] = "AGGRESSIVE"
+            STATE["leverage"] = AGGRESSIVE_LEVERAGE
+            STATE["risk_pct"] = AGGRESSIVE_RISK_PCT
+            save_state()
+            for s in SYMBOLS:
+                configure_symbol(s, AGGRESSIVE_LEVERAGE)
+            await reply(update, f"🔥 تم تفعيل Aggressive {AGGRESSIVE_LEVERAGE}x | Risk {AGGRESSIVE_RISK_PCT}%")
+
+        elif text == "إغلاق الكل 🛑":
+            await reply(update, close_positions_by_filter("all"))
+
+        elif text == "إغلاق الرابحة ✅":
+            await reply(update, close_positions_by_filter("winning"))
+
+        elif text == "إغلاق الخاسرة ❌":
+            await reply(update, close_positions_by_filter("losing"))
+
+        elif text == "طوارئ 🚨":
+            STATE["running"] = False
+            STATE["emergency"] = True
+            save_state()
+            msg = close_positions_by_filter("all")
+            await reply(update, "🚨 تم تفعيل الطوارئ وإيقاف البوت.\n\n" + msg)
+
+        else:
+            await reply(update, "استخدم الأزرار أو الأوامر المتاحة.")
+
+    except Exception as exc:
+        logger.exception("Dashboard error: %s", exc)
+        await reply(update, f"حدث خطأ: {exc}")
+
+
+# =========================================================
+# 11) JOBS: SCAN + MANAGE OPEN POSITIONS
+# =========================================================
+
+async def trading_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if JOB_LOCK.locked():
+        return
+
+    async with JOB_LOCK:
+        if STATE.get("emergency"):
+            return
+        if not STATE.get("running", True):
+            return
+
+        scan_results: Dict[str, Any] = {}
+
+        for symbol in SYMBOLS:
+            try:
+                df = fetch_ohlcv_df(symbol)
+                if df is None:
+                    scan_results[symbol] = {
+                        "symbol": symbol,
+                        "action": "NO_DATA",
+                        "reason": "not enough OHLCV data",
+                        "checked_at": utc_now(),
+                    }
+                    continue
+
+                signal = build_signal(symbol, df)
+                scan_results[symbol] = signal
+
+                if signal["action"] in ("LONG", "SHORT"):
+                    ok, msg = open_position(symbol, signal)
+                    if ok:
+                        await send_to_owner(context, msg)
+                    else:
+                        logger.info("Signal not opened: %s", msg)
+
+            except Exception as exc:
+                logger.exception("trading_job symbol error %s: %s", symbol, exc)
+                scan_results[symbol] = {
+                    "symbol": symbol,
+                    "action": "ERROR",
+                    "reason": str(exc),
+                    "checked_at": utc_now(),
+                }
+
+        STATE["last_scan"] = scan_results
+        save_state()
+
+
+async def manage_positions_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if STATE.get("emergency"):
+        return
+
+    try:
+        positions = fetch_positions_safe(SYMBOLS)
+        cleanup_missing_positions(positions)
+
+        for pos in positions:
+            try:
+                should_close, reason = update_trailing_stop(pos)
+                logger.info(reason)
+
+                if should_close:
+                    ok, msg = close_position(pos["symbol"], reason=reason)
+                    await send_to_owner(context, msg)
+
+            except Exception as exc:
+                logger.exception("Position manage error %s: %s", pos.get("symbol"), exc)
+
+    except Exception as exc:
+        logger.exception("manage_positions_job failed: %s", exc)
+
+
+async def post_init(app: Application) -> None:
+    if app.job_queue is None:
+        raise RuntimeError(
+            "JobQueue is not available. Install with: pip install 'python-telegram-bot[job-queue]'"
+        )
+
+    app.job_queue.run_repeating(
+        trading_job,
+        interval=SCAN_INTERVAL_SECONDS,
+        first=10,
+        name="trading_job",
+    )
+    app.job_queue.run_repeating(
+        manage_positions_job,
+        interval=POSITION_CHECK_SECONDS,
+        first=15,
+        name="manage_positions_job",
+    )
+
+    await app.bot.send_message(
+        chat_id=ENV_CHAT_ID,
+        text=(
+            "✅ Bot started on Render\n"
+            f"Symbols: {', '.join(SYMBOLS)}\n"
+            f"Mode: {STATE.get('mode')} ({STATE.get('leverage')}x)\n"
+            f"Data dir: {DATA_DIR}\n"
+            f"Scan: {SCAN_INTERVAL_SECONDS}s | Manage: {POSITION_CHECK_SECONDS}s"
+        ),
+        reply_markup=DASHBOARD_KEYBOARD,
+    )
+
 
 # =========================================================
 # 12) MAIN
 # =========================================================
-def main():
-    load_stats_from_disk()
-    load_runtime_state()
 
-    threading.Thread(
-        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
-        daemon=True,
-    ).start()
+def main() -> None:
+    start_health_server()
+    init_exchange()
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("wallet", wallet_cmd))
+    application.add_handler(CommandHandler("positions", positions_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
+    application.add_handler(CommandHandler("close", close_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, dashboard_handler))
 
-    if app.job_queue is None:
-        raise RuntimeError('JobQueue unavailable. Install "python-telegram-bot[job-queue]".')
-
-    if ENV_CHAT_ID:
-        app.bot_data["chat_id"] = str(ENV_CHAT_ID)
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("radar", cmd_radar))
-    app.add_handler(CommandHandler("pause", cmd_pause))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("allstats", cmd_allstats))
-    app.add_handler(CommandHandler("best", cmd_best))
-    app.add_handler(CommandHandler("journal", cmd_journal))
-    app.add_handler(CommandHandler("closeall", cmd_close_all))
-    app.add_handler(CallbackQueryHandler(dashboard_handler))
-
-    app.job_queue.run_repeating(trading_job, interval=SCAN_INTERVAL_SECONDS, first=10)
-    app.job_queue.run_repeating(manage_open_positions, interval=POSITION_CHECK_INTERVAL_SECONDS, first=15)
-
-    logger.info(f"Starting Ichimoku Smart Bot... DATA_DIR={DATA_DIR}")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Starting Telegram polling")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
