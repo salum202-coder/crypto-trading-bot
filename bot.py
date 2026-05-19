@@ -1,17 +1,3 @@
-"""
-BingX Futures Live Trading Bot
-Strategy: EMA 200 + RSI Recovery/Rejection + ATR Stop Loss + Parabolic SAR
-Exchange: BingX USDT-M Futures via ccxt
-Telegram: python-telegram-bot with JobQueue
-Hosting: Render compatible health server
-
-IMPORTANT:
-- This bot places REAL market orders when API keys are valid.
-- Stop loss is managed by the bot loop, not as an exchange-native stop order.
-  If the bot/server/API goes offline, the protection loop will not run.
-- Test with very small balance and very small risk first.
-"""
-
 from __future__ import annotations
 
 import os
